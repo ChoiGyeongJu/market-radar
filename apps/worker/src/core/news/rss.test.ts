@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { parseRssFeed } from './rss.js'
+import { parseRssFeed, decodeEntities } from './rss.js'
 
 const FEED = `<?xml version="1.0" encoding="UTF-8"?>
 <rss version="2.0"><channel>
@@ -52,5 +52,25 @@ describe('parseRssFeed', () => {
   it('link가 없는 item은 버린다 — 멱등키를 만들 수 없다', () => {
     const noLink = `<rss><channel><item><title>제목</title></item></channel></rss>`
     expect(parseRssFeed(noLink)).toEqual([])
+  })
+})
+
+describe('decodeEntities', () => {
+  it('숫자 참조가 만든 &를 뒤이은 평문과 엮어 다시 엔티티로 재해석하지 않는다', () => {
+    // &#38; 는 리터럴 "&" 하나를 뜻하는 숫자 참조다. 그 뒤의 "lt;"/"gt;" 는
+    // 소스에 원래부터 있던 평문이지, 앞 단계가 만든 "&"와 합쳐져야 할
+    // 엔티티가 아니다. 순차(hex→decimal→named) 치환이면 decimal 패스가
+    // "&lt;" 를 만들고 named 패스가 그걸 또 "<" 로 풀어버린다.
+    expect(decodeEntities('AT&#38;T defeats &#38;lt;Samsung&#38;gt;')).toBe(
+      'AT&T defeats &lt;Samsung&gt;',
+    )
+  })
+
+  it('16진수 참조가 만든 &도 재해석하지 않는다', () => {
+    expect(decodeEntities('&#x26;quot;hello&#x26;quot;')).toBe('&quot;hello&quot;')
+  })
+
+  it('일반적인 단일 인코딩은 그대로 디코딩한다', () => {
+    expect(decodeEntities('&quot;hi&quot; &#039;there&#039; A&amp;B')).toBe('"hi" \'there\' A&B')
   })
 })

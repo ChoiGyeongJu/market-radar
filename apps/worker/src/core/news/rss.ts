@@ -24,12 +24,25 @@ const NAMED: Record<string, string> = {
   amp: '&', lt: '<', gt: '>', quot: '"', apos: "'", nbsp: ' ',
 }
 
-/** `&quot;` `&#039;` `&#x27;` 를 실제 문자로 되돌린다. */
+/**
+ * `&quot;` `&#039;` `&#x27;` 를 실제 문자로 되돌린다.
+ *
+ * 반드시 한 번의 패스로 처리해야 한다. hex → decimal → named 순으로 나눠서
+ * 세 번 replace 하면, 앞 단계가 만들어낸 `&` 를 뒤 단계가 다시 엔티티 시작으로
+ * 오인해서 과잉 디코딩한다 — 예를 들어 `&#38;lt;` (문자 그대로 "&lt;" 를
+ * 뜻하는 숫자 참조 + 평문)가 decimal 패스에서 `&lt;` 가 된 뒤, named 패스에서
+ * 그걸 또 `<` 로 풀어버린다. 하나의 정규식/alternation 으로 한 번만 스캔하면
+ * replace 가 만든 치환 결과를 다시 스캔하지 않으므로 이 문제가 없다.
+ */
 export function decodeEntities(s: string): string {
-  return s
-    .replace(/&#x([0-9a-f]+);/gi, (_, h: string) => String.fromCodePoint(parseInt(h, 16)))
-    .replace(/&#(\d+);/g, (_, d: string) => String.fromCodePoint(Number(d)))
-    .replace(/&([a-z]+);/gi, (m, n: string) => NAMED[n.toLowerCase()] ?? m)
+  return s.replace(
+    /&#x([0-9a-f]+);|&#(\d+);|&([a-z]+);/gi,
+    (m, hex: string | undefined, dec: string | undefined, name: string | undefined) => {
+      if (hex !== undefined) return String.fromCodePoint(parseInt(hex, 16))
+      if (dec !== undefined) return String.fromCodePoint(Number(dec))
+      return NAMED[name!.toLowerCase()] ?? m
+    },
+  )
 }
 
 function tag(xml: string, name: string): string {
