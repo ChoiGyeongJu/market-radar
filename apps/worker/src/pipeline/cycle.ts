@@ -2,13 +2,14 @@ import { budgetGuard, kstDateString } from '../core/budget.js'
 import { ALERT_THRESHOLD } from '../core/circuit.js'
 import type { Circuit } from '../core/circuit.js'
 import { pollIntervalMs } from '../core/schedule.js'
-import type { EventSource } from '../ports/source.js'
+import { createSeenSet } from '../core/seen.js'
+import type { SeenSet } from '../core/seen.js'
 import type { EventStore } from '../ports/store.js'
 import type { Notifier } from '../ports/notifier.js'
 import type { Summarizer } from '../ports/summarizer.js'
 import type { Heartbeat } from './health.js'
 import { runIngest } from './ingest.js'
-import type { IngestState } from './ingest.js'
+import type { IngestStats, SourcePlan } from './ingest.js'
 import { runDispatch } from './dispatch.js'
 import { catchUpDigests } from './digest.js'
 import type { DigestAttempt } from './digest.js'
@@ -24,7 +25,11 @@ export type CycleLogger = {
 }
 
 export type CycleDeps = {
-  source: EventSource
+  /**
+   * 볼 소스들과 각각을 다루는 방법. 소스마다 폴링 주기·예산·판정이 다르므로
+   * 하나로 묶어 받는다 (ingest.ts 의 SourcePlan).
+   */
+  plans: readonly SourcePlan[]
   store: EventStore
   /** 구독자용 채널. 공시 알림만 나간다. */
   notifier: Notifier
@@ -49,7 +54,16 @@ export type CycleState = {
   /** lastDigestDate 에 막혀 있는 날짜의 연속 실패 횟수. digest.ts 의 catchUpDigests 참고. */
   digestAttempt: DigestAttempt | null
   heartbeatFailures: number
-} & IngestState
+  /**
+   * 소스마다 따로 둔다 — externalId 는 소스 안에서만 유일하다. 공시 접수번호와
+   * 뉴스 guid 가 우연히 겹치면 한 집합에서는 한쪽이 다른 쪽에 가려 안 보인다.
+   */
+  seen: Map<string, SeenSet>
+  /** 소스마다 따로 둔다 — 새로 붙인 소스만 콜드 스타트일 수 있다. */
+  coldStart: Map<string, boolean>
+  /** 소스별 다음 실행 시각(ms). 주기가 서로 다르다. */
+  nextRunAt: Map<string, number>
+}
 
 export type CycleResult = CycleState & { sleepMs: number }
 
@@ -62,37 +76,90 @@ export async function runCycle(
   let heartbeatFailures = state.heartbeatFailures
   // 실패 시에는 진입 상태 그대로 돌려준다 — 특히 coldStart 가 true 로 남아야
   // 기동 직후 DART 가 불통이었던 경우에도 첫 성공 사이클이 억제 사이클이 된다.
-  let ingestState: IngestState = { seen: state.seen, coldStart: state.coldStart }
+  // 소스별로 나뉘었으므로 수집에 성공한 소스만 각자 내려간다 — 한 소스의 장애가
+  // 다른 소스의 억제 사이클을 소모하지 않는다.
+  const seen = new Map(state.seen)
+  const coldStart = new Map(state.coldStart)
+  const nextRunAt = new Map(state.nextRunAt)
+  // 예산 가드에 넘길 사용량. 한도를 추적하는 소스가 올려준 값만 들어간다.
+  let used = 0
   let sleepMs: number
 
   try {
-    const used = await deps.store.incrementApiUsage(deps.source.id, kstDate)
-    const ingest = await runIngest(
-      { source: deps.source, store: deps.store }, ingestState, now,
-    )
-    ingestState = ingest.state
+    // 첫 실패 원인. 바깥 catch 의 'cycle failed' 로그가 래퍼 에러만 남기면
+    // 근본 원인이 그 줄에서 사라지므로 cause 로 달아 보낸다.
+    let firstError: unknown = null
+    const ingested: Array<{
+      sourceId: string; stats: IngestStats; wasColdStart: boolean; seenSize: number
+    }> = []
+
+    for (const plan of deps.plans) {
+      const id = plan.source.id
+      if ((nextRunAt.get(id) ?? 0) > now.getTime()) continue
+      nextRunAt.set(id, now.getTime() + plan.intervalMs(now))
+
+      try {
+        // 한도가 있는 소스만 센다. RSS 를 세면 DART 예산 가드가 엉뚱하게 발동해
+        // 폴링 주기가 2~10배로 늘어진다.
+        if (plan.countsAgainstApiBudget) {
+          used = await deps.store.incrementApiUsage(id, kstDate)
+        }
+        // 처음 보는 소스는 콜드 스타트로 친다 — 새로 붙인 소스도 첫 사이클은
+        // 기록만 하고 한 건도 발송하지 않아야 한다.
+        const wasColdStart = coldStart.get(id) ?? true
+        const ingest = await runIngest(
+          { plan, store: deps.store },
+          { seen: seen.get(id) ?? createSeenSet(), coldStart: wasColdStart },
+          now,
+        )
+        seen.set(id, ingest.state.seen)
+        coldStart.set(id, ingest.state.coldStart)
+        ingested.push({
+          sourceId: id,
+          stats: ingest.stats,
+          wasColdStart,
+          seenSize: ingest.state.seen.size,
+        })
+      } catch (err) {
+        // 한 소스의 장애가 다른 소스의 수집을 막으면 안 된다. 서킷 브레이커는
+        // 바깥 catch 가 담당하므로 여기서는 기록만 한다.
+        deps.log.error({ err, sourceId: id }, 'source ingest failed')
+        if (firstError === null) firstError = err
+      }
+    }
+
+    // 한 소스라도 실패하면 사이클 실패다. 여기서 삼키면 전면 장애에도 서킷
+    // 브레이커가 돌지 않아 연속 실패 알림이 0건 간다. 던지는 위치도 그대로여야
+    // 한다 — 수집이 실패한 사이클에서 발송·다이제스트를 건너뛰는 기존 동작이다.
+    if (firstError !== null) {
+      throw new Error('one or more sources failed', { cause: firstError })
+    }
+
     const dispatch = await runDispatch(
       { store: deps.store, notifier: deps.notifier, summarizer: deps.summarizer }, now,
     )
 
     deps.circuit.recordSuccess()
 
-    // 억제는 반드시 로그에 남긴다. 운영자는 실시간 대응을 하지 않으므로, 재기동 후
-    // "왜 그때 알림이 한 건도 안 왔는가"에 답할 기록이 여기밖에 없다.
-    if (state.coldStart) {
-      deps.log.info(
-        {
-          fetched: ingest.stats.fetched,
-          suppressed: ingest.stats.suppressed,
-          recorded: ingest.stats.recorded,
-          seen: ingest.state.seen.size,
-        },
-        'cold start — backlog recorded, nothing enqueued',
-      )
-    }
+    for (const r of ingested) {
+      // 억제는 반드시 로그에 남긴다. 운영자는 실시간 대응을 하지 않으므로, 재기동 후
+      // "왜 그때 알림이 한 건도 안 왔는가"에 답할 기록이 여기밖에 없다.
+      if (r.wasColdStart) {
+        deps.log.info(
+          {
+            sourceId: r.sourceId,
+            fetched: r.stats.fetched,
+            suppressed: r.stats.suppressed,
+            recorded: r.stats.recorded,
+            seen: r.seenSize,
+          },
+          'cold start — backlog recorded, nothing enqueued',
+        )
+      }
 
-    if (ingest.stats.recorded > 0 || dispatch.sent > 0) {
-      deps.log.info({ ingest: ingest.stats, dispatch, used }, 'cycle')
+      if (r.stats.recorded > 0 || dispatch.sent > 0) {
+        deps.log.info({ sourceId: r.sourceId, ingest: r.stats, dispatch, used }, 'cycle')
+      }
     }
 
     // 자정이 지나면 밀린 날짜를 하루씩 모두 보낸다. `= kstDate` 로 건너뛰면
@@ -102,7 +169,9 @@ export async function runCycle(
       {
         store: deps.store,
         notifier: deps.operatorNotifier,
-        sourceId: deps.source.id,
+        // 공시 다이제스트는 기존 그대로 DART 사용량을 분모로 쓴다. 뉴스
+        // 다이제스트는 3c 에서 따로 붙인다.
+        sourceId: 'dart',
         log: deps.log,
         dailyLimit: deps.dailyLimit,
       },
@@ -113,7 +182,13 @@ export async function runCycle(
     lastDigestDate = caughtUp.lastDigestDate
     digestAttempt = caughtUp.digestAttempt
 
-    sleepMs = budgetGuard(used, pollIntervalMs(now), deps.dailyLimit)
+    // 다음에 깨어나야 할 가장 이른 시각에 맞춘다 — 가장 짧은 주기의 소스를
+    // 놓치지 않으려면 그쪽 기준이어야 한다. 1초 하한은 주기가 0 이하로 잡힌
+    // 소스가 루프를 바쁘게 돌리는 것을 막는다.
+    const deltas = [...nextRunAt.values()].map((t) => t - now.getTime())
+    // 소스가 하나도 없으면 Math.min() 이 Infinity 라 영원히 잠든다.
+    const soonest = deltas.length > 0 ? Math.min(...deltas) : pollIntervalMs(now)
+    sleepMs = budgetGuard(used, Math.max(soonest, 1_000), deps.dailyLimit)
   } catch (err) {
     deps.circuit.recordFailure()
     const failures = deps.circuit.consecutiveFailures()
@@ -145,8 +220,9 @@ export async function runCycle(
     lastDigestDate,
     digestAttempt,
     heartbeatFailures,
-    seen: ingestState.seen,
-    coldStart: ingestState.coldStart,
+    seen,
+    coldStart,
+    nextRunAt,
   }
 }
 

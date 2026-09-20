@@ -1,9 +1,10 @@
 import { describe, it, expect, vi } from 'vitest'
 import type { NormalizedEvent } from '@app/shared'
+import { evaluateDart } from '../core/dart/rules.js'
 import type { EventSource } from '../ports/source.js'
 import type { EventStore } from '../ports/store.js'
 import { createSeenSet } from '../core/seen.js'
-import { runIngest, type IngestState } from './ingest.js'
+import { runIngest, type IngestState, type SourcePlan } from './ingest.js'
 
 const NOW = new Date('2026-09-19T06:30:00Z')
 
@@ -43,11 +44,16 @@ function fakeSource(events: NormalizedEvent[]): EventSource {
   return { id: 'dart', fetchLatest: async () => events }
 }
 
+/** 공시 소스의 계획. 판정은 evaluateDart, 주기 10초, 한도 추적 대상이다. */
+function plan(source: EventSource): SourcePlan {
+  return { source, evaluate: evaluateDart, intervalMs: () => 10_000, countsAgainstApiBudget: true }
+}
+
 describe('runIngest', () => {
   it('pass 이벤트는 enqueue=true로 기록한다', async () => {
     const { store, recordEvent } = fakeStore()
     const { stats } = await runIngest(
-      { source: fakeSource([mkEvent()]), store }, warm([ID.older]), NOW,
+      { plan: plan(fakeSource([mkEvent()])), store }, warm([ID.older]), NOW,
     )
 
     expect(stats).toMatchObject({ fetched: 1, recorded: 1, enqueued: 1, suppressed: 0 })
@@ -65,7 +71,7 @@ describe('runIngest', () => {
     // 실제로 검증하려는 것은 no-keyword-match 사유 자체이므로, 여전히 어떤 목록에도
     // 없는 감사보고서제출(실측 12건)로 픽스처를 교체한다.
     const { stats } = await runIngest(
-      { source: fakeSource([mkEvent({ title: '감사보고서제출' })]), store },
+      { plan: plan(fakeSource([mkEvent({ title: '감사보고서제출' })])), store },
       warm([ID.older]),
       NOW,
     )
@@ -81,17 +87,36 @@ describe('runIngest', () => {
   it('중복은 duplicated로 집계한다', async () => {
     const { store } = fakeStore(false)
     const { stats } = await runIngest(
-      { source: fakeSource([mkEvent()]), store }, warm([ID.older]), NOW,
+      { plan: plan(fakeSource([mkEvent()])), store }, warm([ID.older]), NOW,
     )
     expect(stats).toMatchObject({ recorded: 0, duplicated: 1 })
   })
 
   it('빈 응답도 안전하게 처리한다', async () => {
     const { store } = fakeStore()
-    const { stats } = await runIngest({ source: fakeSource([]), store }, warm([ID.older, ID.mid]), NOW)
+    const { stats } = await runIngest({ plan: plan(fakeSource([])), store }, warm([ID.older, ID.mid]), NOW)
     expect(stats).toEqual({
       fetched: 0, skipped: 0, recorded: 0, enqueued: 0, suppressed: 0, duplicated: 0,
     })
+  })
+
+  it('판정 함수를 주입받는다 — 소스마다 룰이 다르다', async () => {
+    const { store, recordEvent } = fakeStore()
+    const source = fakeSource([
+      { sourceId: 'news', externalId: 'n1', occurredAt: null, firstSeenAt: new Date(),
+        title: '아무 제목', url: 'https://x/1', raw: {} },
+    ])
+    const alwaysPass = () => ({ action: 'pass', tier: 'high', rule: 'test' }) as const
+    await runIngest(
+      { plan: { source, evaluate: alwaysPass, intervalMs: () => 30_000, countsAgainstApiBudget: false }, store },
+      { seen: createSeenSet([]), coldStart: false },
+      new Date(),
+    )
+    expect(recordEvent).toHaveBeenCalledWith(
+      expect.objectContaining({ externalId: 'n1' }),
+      { action: 'pass', tier: 'high', rule: 'test' },
+      expect.objectContaining({ enqueue: true }),
+    )
   })
 })
 
@@ -109,7 +134,7 @@ describe('runIngest — 이미 본 공시 집합', () => {
       mkEvent({ externalId: ID.mid }),
     ]
 
-    const { stats } = await runIngest({ source: fakeSource(events), store }, warm([ID.older, ID.mid]), NOW)
+    const { stats } = await runIngest({ plan: plan(fakeSource(events)), store }, warm([ID.older, ID.mid]), NOW)
 
     expect(stats).toMatchObject({ fetched: 2, skipped: 2, recorded: 0 })
     expect(recordEvent).not.toHaveBeenCalled() // 트랜잭션 0건
@@ -123,7 +148,7 @@ describe('runIngest — 이미 본 공시 집합', () => {
       mkEvent({ externalId: ID.older }),
     ]
 
-    const { stats } = await runIngest({ source: fakeSource(events), store }, warm([ID.older, ID.mid]), NOW)
+    const { stats } = await runIngest({ plan: plan(fakeSource(events)), store }, warm([ID.older, ID.mid]), NOW)
 
     expect(stats).toMatchObject({ fetched: 3, skipped: 2, recorded: 1 })
     expect(recordEvent).toHaveBeenCalledTimes(1)
@@ -138,7 +163,7 @@ describe('runIngest — 이미 본 공시 집합', () => {
     const { store } = fakeStore()
     const events = [mkEvent({ externalId: ID.newer }), mkEvent({ externalId: ID.mid })]
 
-    const { state } = await runIngest({ source: fakeSource(events), store }, warm([ID.older]), NOW)
+    const { state } = await runIngest({ plan: plan(fakeSource(events)), store }, warm([ID.older]), NOW)
 
     expect(state.seen.has(ID.newer)).toBe(true)
     expect(state.seen.has(ID.mid)).toBe(true)
@@ -150,11 +175,11 @@ describe('runIngest — 이미 본 공시 집합', () => {
     const events = [mkEvent({ externalId: ID.newer }), mkEvent({ externalId: ID.mid })]
     const source = fakeSource(events)
 
-    const first = await runIngest({ source, store }, warm([ID.older]), NOW)
+    const first = await runIngest({ plan: plan(source), store }, warm([ID.older]), NOW)
     recordEvent.mockClear()
 
     // 목록 API가 같은 100건을 다시 돌려주는 상황 그대로.
-    const second = await runIngest({ source, store }, first.state, NOW)
+    const second = await runIngest({ plan: plan(source), store }, first.state, NOW)
 
     expect(second.stats).toMatchObject({ fetched: 2, skipped: 2, recorded: 0 })
     expect(recordEvent).not.toHaveBeenCalled()
@@ -171,7 +196,7 @@ describe('runIngest — 이미 본 공시 집합', () => {
         mkEvent({ externalId: '20260919000150' }),
       ]
 
-      const { stats } = await runIngest({ source: fakeSource(events), store }, warm([ID.older]), NOW)
+      const { stats } = await runIngest({ plan: plan(fakeSource(events)), store }, warm([ID.older]), NOW)
 
       expect(stats).toMatchObject({ fetched: 3, skipped: 0, recorded: 3 })
       expect(recordEvent).toHaveBeenCalledTimes(3)
@@ -188,14 +213,14 @@ describe('runIngest — 이미 본 공시 집합', () => {
 
       // 1사이클 — 10:05 접수(번호가 큼)가 먼저 공개됐다.
       const first = await runIngest(
-        { source: fakeSource([mkEvent({ externalId: ID.newer })]), store }, warm(), NOW,
+        { plan: plan(fakeSource([mkEvent({ externalId: ID.newer })])), store }, warm(), NOW,
       )
       expect(first.stats.recorded).toBe(1)
       recordEvent.mockClear()
 
       // 2사이클 — 10:00 접수(번호가 작음)가 심사를 거쳐 뒤늦게 공개됐다.
       const second = await runIngest(
-        { source: fakeSource([mkEvent({ externalId: ID.mid })]), store }, first.state, NOW,
+        { plan: plan(fakeSource([mkEvent({ externalId: ID.mid })])), store }, first.state, NOW,
       )
 
       // 알림을 잃지 않는 것이 이 시스템의 첫 번째 약속이다. 조용한 영구 누락은
@@ -218,7 +243,7 @@ describe('runIngest — 이미 본 공시 집합', () => {
       const perCycle: number[] = []
       for (let i = 0; i < 4; i += 1) {
         recordEvent.mockClear()
-        const r = await runIngest({ source, store }, state, NOW)
+        const r = await runIngest({ plan: plan(source), store }, state, NOW)
         perCycle.push(recordEvent.mock.calls.length)
         state = r.state
       }
@@ -237,10 +262,10 @@ describe('runIngest — 이미 본 공시 집합', () => {
 
       // mid, newer 를 처리하면 상한 2를 넘겨 가장 오래된 older 가 밀려난다.
       state = (await runIngest(
-        { source: fakeSource([mkEvent({ externalId: ID.mid })]), store }, state, NOW,
+        { plan: plan(fakeSource([mkEvent({ externalId: ID.mid })])), store }, state, NOW,
       )).state
       state = (await runIngest(
-        { source: fakeSource([mkEvent({ externalId: ID.newer })]), store }, state, NOW,
+        { plan: plan(fakeSource([mkEvent({ externalId: ID.newer })])), store }, state, NOW,
       )).state
 
       expect(state.seen.size).toBe(2)
@@ -250,7 +275,7 @@ describe('runIngest — 이미 본 공시 집합', () => {
       // 축출된 older 가 다시 목록에 나타나면 재처리된다.
       recordEvent.mockClear()
       const again = await runIngest(
-        { source: fakeSource([mkEvent({ externalId: ID.older })]), store }, state, NOW,
+        { plan: plan(fakeSource([mkEvent({ externalId: ID.older })])), store }, state, NOW,
       )
 
       expect(again.stats.recorded).toBe(1)
@@ -263,7 +288,7 @@ describe('runIngest — 이미 본 공시 집합', () => {
     const events = [mkEvent({ externalId: ID.older }), mkEvent({ externalId: ID.newer })]
 
     const { stats, state } = await runIngest(
-      { source: fakeSource(events), store }, warm(), NOW,
+      { plan: plan(fakeSource(events)), store }, warm(), NOW,
     )
 
     expect(stats).toMatchObject({ skipped: 0, recorded: 2 })
@@ -287,7 +312,7 @@ describe('runIngest — 콜드 스타트 억제', () => {
       mkEvent({ externalId: ID.newer }),
     ]
 
-    const { stats } = await runIngest({ source: fakeSource(events), store }, cold(), NOW)
+    const { stats } = await runIngest({ plan: plan(fakeSource(events)), store }, cold(), NOW)
 
     expect(stats).toMatchObject({ fetched: 2, recorded: 2, enqueued: 0, suppressed: 2 })
     for (const call of recordEvent.mock.calls) {
@@ -298,7 +323,7 @@ describe('runIngest — 콜드 스타트 억제', () => {
   it('억제해도 판정 자체는 pass 그대로 기록한다 — 룰 튜닝 데이터를 오염시키지 않는다', async () => {
     const { store, recordEvent } = fakeStore()
 
-    await runIngest({ source: fakeSource([mkEvent({ externalId: ID.mid })]), store }, cold(), NOW)
+    await runIngest({ plan: plan(fakeSource([mkEvent({ externalId: ID.mid })])), store }, cold(), NOW)
 
     expect(recordEvent).toHaveBeenCalledWith(
       expect.anything(),
@@ -310,7 +335,7 @@ describe('runIngest — 콜드 스타트 억제', () => {
   it('첫 사이클이 끝나면 coldStart 가 내려간다', async () => {
     const { store } = fakeStore()
     const { state } = await runIngest(
-      { source: fakeSource([mkEvent({ externalId: ID.mid })]), store }, cold(), NOW,
+      { plan: plan(fakeSource([mkEvent({ externalId: ID.mid })])), store }, cold(), NOW,
     )
     expect(state.coldStart).toBe(false)
   })
@@ -319,12 +344,12 @@ describe('runIngest — 콜드 스타트 억제', () => {
     const { store, recordEvent } = fakeStore()
     const source = fakeSource([mkEvent({ externalId: ID.mid })])
 
-    const first = await runIngest({ source, store }, cold(), NOW)
+    const first = await runIngest({ plan: plan(source), store }, cold(), NOW)
     expect(first.stats.enqueued).toBe(0)
 
     recordEvent.mockClear()
     const second = await runIngest(
-      { source: fakeSource([mkEvent({ externalId: ID.newer })]), store }, first.state, NOW,
+      { plan: plan(fakeSource([mkEvent({ externalId: ID.newer })])), store }, first.state, NOW,
     )
 
     expect(second.stats).toMatchObject({ enqueued: 1, suppressed: 0 })
@@ -340,7 +365,7 @@ describe('runIngest — 콜드 스타트 억제', () => {
       '발송하지 않을 건에 만료 시각을 달면 outbox 에 없는 행의 TTL 을 따지게 된다',
     async () => {
       const { store, recordEvent } = fakeStore()
-      await runIngest({ source: fakeSource([mkEvent({ externalId: ID.mid })]), store }, cold(), NOW)
+      await runIngest({ plan: plan(fakeSource([mkEvent({ externalId: ID.mid })])), store }, cold(), NOW)
       expect(recordEvent.mock.calls[0]?.[2]).toMatchObject({ expiresAt: null })
     },
   )
@@ -348,7 +373,7 @@ describe('runIngest — 콜드 스타트 억제', () => {
   it('콜드 스타트여도 이미 본 id 는 여전히 건너뛴다 — 억제와 집합은 독립적이다', async () => {
     const { store, recordEvent } = fakeStore()
     const { stats } = await runIngest(
-      { source: fakeSource([mkEvent({ externalId: ID.older })]), store }, cold(), NOW,
+      { plan: plan(fakeSource([mkEvent({ externalId: ID.older })])), store }, cold(), NOW,
     )
     expect(stats).toMatchObject({ skipped: 1, recorded: 0 })
     expect(recordEvent).not.toHaveBeenCalled()

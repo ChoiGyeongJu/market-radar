@@ -1,13 +1,20 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
+import type { NormalizedEvent, Verdict } from '@app/shared'
 import { kstDateString } from '../core/budget.js'
 import { createCircuit, ALERT_THRESHOLD } from '../core/circuit.js'
+import { evaluateDart } from '../core/dart/rules.js'
+import { pollIntervalMs } from '../core/schedule.js'
 import { createSeenSet } from '../core/seen.js'
 import type { EventSource } from '../ports/source.js'
 import type { EventStore } from '../ports/store.js'
 import type { Notifier } from '../ports/notifier.js'
 import type { Summarizer } from '../ports/summarizer.js'
 import type { Heartbeat } from './health.js'
-import { runCycle, runLoop, createSleeper, type CycleLogger, type CycleState, type Sleeper } from './cycle.js'
+import type { SourcePlan } from './ingest.js'
+import {
+  runCycle, runLoop, createSleeper,
+  type CycleDeps, type CycleLogger, type CycleState, type Sleeper,
+} from './cycle.js'
 
 const NOW = new Date('2026-09-19T06:30:00Z')
 const TODAY = kstDateString(NOW)
@@ -22,8 +29,10 @@ function warmState(heartbeatFailures = 0): CycleState {
     lastDigestDate: TODAY,
     digestAttempt: null,
     heartbeatFailures,
-    seen: createSeenSet(['20260919000100']),
-    coldStart: false,
+    // seen·coldStart 는 소스별이다 — externalId 는 소스 안에서만 유일하다.
+    seen: new Map([['dart', createSeenSet(['20260919000100'])]]),
+    coldStart: new Map([['dart', false]]),
+    nextRunAt: new Map(),
   }
 }
 
@@ -43,6 +52,13 @@ function healthyStore(): EventStore {
 }
 
 const source: EventSource = { id: 'dart', fetchLatest: async () => [] }
+/** 기존 단일 소스 테스트가 쓰던 공시 소스 그대로 — 주기·예산·판정이 운영과 같다. */
+const dartPlan: SourcePlan = {
+  source,
+  evaluate: evaluateDart,
+  intervalMs: pollIntervalMs,
+  countsAgainstApiBudget: true,
+}
 const summarizer: Summarizer = { summarize: async () => null }
 
 describe('runCycle — heartbeat 은 finally 에 있어야 한다 (회귀 테스트)', () => {
@@ -57,7 +73,7 @@ describe('runCycle — heartbeat 은 finally 에 있어야 한다 (회귀 테스
 
     const result = await runCycle(
       {
-        source, store: failingStore(), notifier, operatorNotifier: notifier, summarizer, heartbeat,
+        plans: [dartPlan], store: failingStore(), notifier, operatorNotifier: notifier, summarizer, heartbeat,
         circuit: createCircuit(), log, dailyLimit: 20_000,
       },
       warmState(),
@@ -77,7 +93,7 @@ describe('runCycle — heartbeat 은 finally 에 있어야 한다 (회귀 테스
 
     const result = await runCycle(
       {
-        source, store: healthyStore(), notifier, operatorNotifier: notifier, summarizer, heartbeat,
+        plans: [dartPlan], store: healthyStore(), notifier, operatorNotifier: notifier, summarizer, heartbeat,
         circuit: createCircuit(), log, dailyLimit: 20_000,
       },
       warmState(),
@@ -96,7 +112,7 @@ describe('runCycle — heartbeat 은 finally 에 있어야 한다 (회귀 테스
 
     const result = await runCycle(
       {
-        source, store: failingStore(), notifier, operatorNotifier: notifier, summarizer, heartbeat,
+        plans: [dartPlan], store: failingStore(), notifier, operatorNotifier: notifier, summarizer, heartbeat,
         circuit: createCircuit(), log, dailyLimit: 20_000,
       },
       warmState(2),
@@ -170,7 +186,7 @@ describe('runLoop — 종료 신호가 대기 중에 오면 다음 사이클 없
 
     await runLoop(
       {
-        source, store, notifier, operatorNotifier: notifier, summarizer, heartbeat,
+        plans: [dartPlan], store, notifier, operatorNotifier: notifier, summarizer, heartbeat,
         circuit: createCircuit(), log, dailyLimit: 20_000,
       },
       warmState(),
@@ -192,7 +208,7 @@ describe('runLoop — 종료 신호가 대기 중에 오면 다음 사이클 없
 
     await runLoop(
       {
-        source, store, notifier, operatorNotifier: notifier, summarizer, heartbeat,
+        plans: [dartPlan], store, notifier, operatorNotifier: notifier, summarizer, heartbeat,
         circuit: createCircuit(), log, dailyLimit: 20_000,
       },
       warmState(),
@@ -220,14 +236,18 @@ describe('runCycle — 운영자 알림은 구독자 채널로 가지 않는다'
     const circuit = createCircuit()
     const heartbeat: Heartbeat = { ping: vi.fn(async () => true) }
     const deps = {
-      source, store: failingStore(), notifier: subscriber, operatorNotifier: operator,
+      plans: [dartPlan], store: failingStore(), notifier: subscriber, operatorNotifier: operator,
       summarizer, heartbeat, circuit, log: silentLog(), dailyLimit: 20_000,
     }
 
-    // ALERT_THRESHOLD(5) 회째에 알림이 나간다.
+    // ALERT_THRESHOLD(5) 회째에 알림이 나간다. 소스별 nextRunAt 이 생겼으므로
+    // 매 사이클 시계를 폴링 주기만큼 밀어야 실제로 5회 폴링한다 — 같은 시각으로
+    // 다섯 번 부르면 2회차부터 주기 미달로 건너뛰어 실패가 쌓이지 않는다.
+    // 운영에서는 실패 후 sleep 이 최소 폴링 주기이므로 이 진행이 실제 동작과 같다.
     let state = warmState()
     for (let i = 0; i < ALERT_THRESHOLD; i += 1) {
-      const { sleepMs: _sleepMs, ...next } = await runCycle(deps, state, NOW)
+      const at = new Date(NOW.getTime() + i * pollIntervalMs(NOW))
+      const { sleepMs: _sleepMs, ...next } = await runCycle(deps, state, at)
       state = next
     }
 
@@ -252,7 +272,7 @@ describe('runCycle — 운영자 알림은 구독자 채널로 가지 않는다'
     // 어제 날짜를 들고 들어가면 이번 사이클에 어제치 다이제스트가 나간다.
     await runCycle(
       {
-        source, store, notifier: subscriber, operatorNotifier: operator,
+        plans: [dartPlan], store, notifier: subscriber, operatorNotifier: operator,
         summarizer, heartbeat, circuit: createCircuit(), log: silentLog(), dailyLimit: 20_000,
       },
       { ...warmState(), lastDigestDate: '2026-09-18' },
@@ -262,5 +282,98 @@ describe('runCycle — 운영자 알림은 구독자 채널로 가지 않는다'
     expect(operator.send).toHaveBeenCalledTimes(1)
     expect(vi.mocked(operator.send).mock.calls[0]?.[0]).toContain('리포트')
     expect(subscriber.send).not.toHaveBeenCalled()
+  })
+})
+
+/**
+ * 3a — 소스가 둘 이상이 된다. 주기(DART 10초 / RSS 30초~3분), 예산(DART 만 한도
+ * 추적), 판정 함수가 소스마다 달라 SourcePlan 으로 묶어 넘긴다.
+ */
+describe('runCycle — 다중 소스', () => {
+  /** 월요일 KST 10:00 — 장중이라 폴링 주기가 가장 짧은 구간이다. */
+  const MULTI_NOW = new Date('2026-09-21T01:00:00Z')
+
+  function fakePlan(id: string, intervalMs: number, countsAgainstApiBudget = true) {
+    return {
+      source: {
+        id,
+        fetchLatest: vi.fn(async (_now: Date): Promise<NormalizedEvent[]> => []),
+      },
+      evaluate: (): Verdict => ({ action: 'drop', reason: 'test' }),
+      intervalMs: () => intervalMs,
+      countsAgainstApiBudget,
+    }
+  }
+
+  function depsWith(plans: readonly SourcePlan[]): CycleDeps {
+    const store = {
+      incrementApiUsage: vi.fn(async () => 1),
+      claimPending: async () => [],
+    } as unknown as EventStore
+    const notifier: Notifier = { send: vi.fn(async () => ({ ok: true }) as const) }
+    return {
+      plans,
+      store,
+      notifier,
+      operatorNotifier: notifier,
+      summarizer,
+      heartbeat: { ping: vi.fn(async () => true) },
+      circuit: createCircuit(),
+      log: silentLog(),
+      dailyLimit: 20_000,
+    }
+  }
+
+  function initialState(plans: readonly SourcePlan[]): CycleState {
+    return {
+      lastDigestDate: kstDateString(MULTI_NOW),
+      digestAttempt: null,
+      heartbeatFailures: 0,
+      seen: new Map(plans.map((p) => [p.source.id, createSeenSet([])])),
+      coldStart: new Map(plans.map((p) => [p.source.id, false])),
+      nextRunAt: new Map(),
+    }
+  }
+
+  it('주기가 아직 안 된 소스는 건너뛴다', async () => {
+    const fast = fakePlan('dart', 10_000)
+    const slow = fakePlan('news', 60_000)
+    const deps = depsWith([fast, slow])
+    let state = initialState([fast, slow])
+
+    state = await runCycle(deps, state, new Date('2026-09-21T01:00:00Z'))
+    expect(fast.source.fetchLatest).toHaveBeenCalledTimes(1)
+    expect(slow.source.fetchLatest).toHaveBeenCalledTimes(1)
+
+    // 10초 뒤 — 빠른 소스만 다시 본다
+    state = await runCycle(deps, state, new Date('2026-09-21T01:00:10Z'))
+    expect(fast.source.fetchLatest).toHaveBeenCalledTimes(2)
+    expect(slow.source.fetchLatest).toHaveBeenCalledTimes(1)
+  })
+
+  it('api_usage는 예산이 있는 소스만 올린다', async () => {
+    const dart = fakePlan('dart', 10_000, true)
+    const news = fakePlan('news', 10_000, false)
+    const deps = depsWith([dart, news])
+    await runCycle(deps, initialState([dart, news]), new Date('2026-09-21T01:00:00Z'))
+    expect(deps.store.incrementApiUsage).toHaveBeenCalledTimes(1)
+    expect(deps.store.incrementApiUsage).toHaveBeenCalledWith('dart', expect.any(String))
+  })
+
+  it('한 소스가 던져도 다른 소스는 처리된다', async () => {
+    const bad = fakePlan('dart', 10_000)
+    bad.source.fetchLatest = vi.fn().mockRejectedValue(new Error('DART down'))
+    const good = fakePlan('news', 10_000)
+    const deps = depsWith([bad, good])
+    await runCycle(deps, initialState([bad, good]), new Date('2026-09-21T01:00:00Z'))
+    expect(good.source.fetchLatest).toHaveBeenCalledTimes(1)
+  })
+
+  it('seen-set은 소스마다 따로다 — externalId가 충돌할 수 있다', async () => {
+    const a = fakePlan('dart', 10_000)
+    const b = fakePlan('news', 10_000)
+    const deps = depsWith([a, b])
+    const state = await runCycle(deps, initialState([a, b]), new Date('2026-09-21T01:00:00Z'))
+    expect(state.seen.get('dart')).not.toBe(state.seen.get('news'))
   })
 })

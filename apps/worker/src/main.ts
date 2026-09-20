@@ -3,6 +3,8 @@ import postgres from 'postgres'
 import pino from 'pino'
 import { kstDateString } from './core/budget.js'
 import { createCircuit } from './core/circuit.js'
+import { evaluateDart } from './core/dart/rules.js'
+import { pollIntervalMs } from './core/schedule.js'
 import { createSeenSet, SEEN_CAPACITY } from './core/seen.js'
 import { loadConfig } from './config.js'
 import { createDartSource } from './adapters/sources/dart.js'
@@ -21,6 +23,14 @@ async function main(): Promise<void> {
   const db = drizzle(sql) as unknown as Db
   const store = createPostgresStore(db)
   const source = createDartSource({ apiKey: cfg.dartApiKey })
+  // 소스 하나뿐이지만 runCycle 은 이제 SourcePlan 목록을 받는다. 주기·예산·판정은
+  // 기존 공시 동작 그대로다 (뉴스 소스는 다음 태스크에서 붙인다).
+  const dartPlan = {
+    source,
+    evaluate: evaluateDart,
+    intervalMs: pollIntervalMs,
+    countsAgainstApiBudget: true,
+  }
   const notifier = createTelegramNotifier(cfg.telegram)
   // 운영자 채널이 설정되면 다이제스트와 장애 알림만 그쪽으로 뺀다. 토큰 버킷은
   // 인스턴스마다 따로인데, 텔레그램의 분당 한도가 채팅 단위라 이쪽이 맞다.
@@ -72,18 +82,20 @@ async function main(): Promise<void> {
 
   await runLoop(
     {
-      source, store, notifier, operatorNotifier, summarizer, heartbeat, circuit, log,
+      plans: [dartPlan], store, notifier, operatorNotifier, summarizer, heartbeat, circuit, log,
       dailyLimit: cfg.dartDailyLimit,
     },
     {
       lastDigestDate,
       digestAttempt: null,
       heartbeatFailures: 0,
-      seen,
+      // seen·coldStart 는 소스별이다 — externalId 는 소스 안에서만 유일하다.
+      seen: new Map([[source.id, seen]]),
       // 첫 사이클은 기록만 하고 한 건도 발송하지 않는다. 워커는 자신이 얼마나
       // 오래 죽어 있었는지 알 수 없으므로, 처음 보는 물량이 신규 1건인지
       // 사흘치 밀린 것인지 구분할 방법이 없다 (스펙 §6.4).
-      coldStart: true,
+      coldStart: new Map([[source.id, true]]),
+      nextRunAt: new Map(),
     },
     sleeper,
     { shouldStop: () => shuttingDown },
