@@ -1439,12 +1439,12 @@ it('NEWS_ENABLED=true면 켜진다', () => {
   expect(loadConfig({ ...base(), NEWS_ENABLED: 'true' }).newsEnabled).toBe(true)
 })
 
-it('NEWS_INTERVAL_MS 기본값은 30초 — RSS 반영 지연 앞에서 더 짧게 할 이유가 없다', () => {
-  expect(loadConfig(base()).newsIntervalMs).toBe(30_000)
+it('NEWS_INTERVAL_MS 기본값은 60초 — 조건부 요청이 거의 안 먹어 매번 전문을 받는다', () => {
+  expect(loadConfig(base()).newsIntervalMs).toBe(60_000)
 })
 
 it('빈 문자열은 기본값으로 접힌다', () => {
-  expect(loadConfig({ ...base(), NEWS_INTERVAL_MS: '' }).newsIntervalMs).toBe(30_000)
+  expect(loadConfig({ ...base(), NEWS_INTERVAL_MS: '' }).newsIntervalMs).toBe(60_000)
 })
 ```
 
@@ -1461,10 +1461,11 @@ Expected: FAIL — `newsEnabled` 가 없다
   // 배포와 활성화를 분리한다. 이미지가 올라간 뒤에도 켜기 전까지 기존 동작
   // 그대로이므로, 뉴스가 채널을 뒤덮으면 이미지를 되돌리지 않고 끌 수 있다.
   NEWS_ENABLED: optionalField(z.enum(['true', 'false']).default('false')),
-  // RSS 반영 지연이 중앙값 3.5분이다(스펙 §4.2). 그 앞에서 폴링 주기는 반올림
-  // 오차이므로 30초보다 짧게 할 이유가 없다.
+  // 60초. RSS 반영 지연이 중앙값 3.5분(210초)이라 폴링 주기는 반올림 오차에 가깝고,
+  // 조건부 요청이 실측상 5개 중 1개에서만 먹는다(스펙 §4.3) — 나머지는 매번 전문을
+  // 다시 받는다. 30초면 하루 1.2GB, 60초면 0.6GB이고 지연은 6.7%만 나빠진다.
   NEWS_INTERVAL_MS: optionalField(
-    z.coerce.number().int().positive().default(30_000),
+    z.coerce.number().int().positive().default(60_000),
   ),
 ```
 
@@ -1592,8 +1593,9 @@ import type { SourcePlan } from './pipeline/ingest.js'
 ```bash
 # 뉴스 소스 (3단계). 기본은 꺼짐 — 배포와 활성화를 분리한다.
 NEWS_ENABLED=false
-# RSS 폴링 주기(ms). 반영 지연이 중앙값 3.5분이라 30초보다 짧게 할 이유가 없다.
-NEWS_INTERVAL_MS=30000
+# RSS 폴링 주기(ms). 반영 지연이 중앙값 3.5분이고 조건부 요청이 5곳 중 1곳에서만
+# 먹어 나머지는 매번 전문을 다시 받는다 — 30초면 하루 1.2GB, 60초면 0.6GB다.
+NEWS_INTERVAL_MS=60000
 ```
 
 - [ ] **Step 8: 전체 검증**
