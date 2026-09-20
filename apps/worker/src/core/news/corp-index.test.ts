@@ -8,6 +8,9 @@ const INDEX = buildCorpIndex([
   { name: '한창', ticker: '005110' },      // 일반 부사
   { name: '진영', ticker: '285800' },      // 사람 이름
   { name: 'CJ', ticker: '001040' },        // 2글자 영문
+  { name: 'SK', ticker: '001200' },        // 경계 테스트용
+  { name: 'LG', ticker: '003550' },        // 경계 테스트용
+  { name: 'CJ대한통운', ticker: '000023' }, // 혼합 이름 테스트용
 ])
 
 describe('matchCorp', () => {
@@ -41,5 +44,23 @@ describe('matchCorp', () => {
 
   it('매칭이 없으면 null', () => {
     expect(matchCorp('오늘 날씨는 맑겠습니다', INDEX)).toBeNull()
+  })
+
+  it('라틴 약어는 단어 경계가 필요하다', () => {
+    // SKY캐슬에서 SK 부분과 매칭하면 안 됨 (단어 경계 없음)
+    expect(matchCorp('SKY캐슬 후속작 관련주 급등, 증시 훈풍', INDEX)).toBeNull()
+    // LGBT에서 LG 부분과 매칭하면 안 됨 (단어 경계 없음)
+    expect(matchCorp('LGBT 인권단체 성명 발표, 코스피 급등과 무관', INDEX)).toBeNull()
+  })
+
+  it('라틴 약어 경계 처리 — 독립 토큰은 매칭한다', () => {
+    // CJ대한통운 (혼합) — 더 길어서 우선
+    expect(matchCorp('CJ대한통운 주가 급등', INDEX)?.ticker).toBe('000023')
+    // SK 독립 토큰 (문맥 신호 있음)
+    expect(matchCorp('SK 주가 급등', INDEX)?.ticker).toBe('001200')
+    // CJ 독립 토큰 (문맥 신호 있음)
+    expect(matchCorp('CJ 주가 급등', INDEX)?.ticker).toBe('001040')
+    // CJ 독립 토큰 (문맥 신호 없음) — 모호하면 문맥 필요
+    expect(matchCorp('CJ 대한통운 파업', INDEX)).toBeNull()
   })
 })
