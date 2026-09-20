@@ -347,6 +347,13 @@ git commit -m "feat(news): 상장사 매칭 — 모호한 55개는 문맥 신호
 
 **Why:** 스펙 §5.2. DART 키워드셋을 재활용하되 뉴스 제목이 자유 형식이라 표현 변형(`수주`/`계약 체결`/`공급 계약`)을 흡수해야 한다. `description` 은 판정에만 쓰고 넘기지 않는다.
 
+**실측이 두 가지를 강제했다.** 실제 상장사 1,895개 인덱스에 실시간 기사 461건을 물려 두 게이트를 통과시킨 결과:
+
+- **종목은 제목에서만 찾는다.** 본문까지 보면 통과 18건 중 9건이 제목에 종목명이 없었고, 그 9건은 성격이 달랐다. `"고배당 기업 건보료 제외, 법적근거 마련해야"` 가 삼성전자로 잡혔는데 이건 정책 기사다. 더 나쁜 것은 `"한섬, 2028년까지 자사주 매입·소각"` 이 **현대백화점**으로 잡힌 경우다 — 본문의 모회사가 제목의 실제 주체를 밀어냈다. 노이즈가 아니라 **오귀속**이다. 우리가 발송하는 것은 제목과 링크뿐이라, 제목에 회사 이름이 없는 알림은 받는 사람에게 설명이 되지 않는다.
+- **critical 티어는 키워드도 제목에 있어야 한다.** 실측의 최악 오탐이 그 티어였다 — `"맥쿼리 가비아 공개매수 무산"` 이 본문의 `상장폐지` 때문에 critical 로 나갔다. 공개매수 무산은 상장폐지가 아니다. critical 은 병합을 건너뛰고 즉시 나가는 티어라 틀렸을 때 가장 비싸다.
+
+`high`/`normal` 은 본문 키워드를 그대로 쓴다 — 제목만으로는 `"삼성전자, 3분기 실적 발표"` 가 호실적인지 어닝쇼크인지 알 수 없다.
+
 - [ ] **Step 1: 실패하는 테스트를 쓴다**
 
 ```ts
@@ -394,7 +401,26 @@ describe('evaluateNews', () => {
     }
   })
 
-  it('description에만 있는 키워드도 판정에 쓴다', () => {
+  it('종목이 description에만 있으면 drop한다 — 오귀속을 막는다', () => {
+    // 실측: "한섬, 자사주 매입·소각" 이 본문의 모회사 때문에 현대백화점으로 잡혔다.
+    expect(evaluateNews(ev('자사주 매입·소각 결정'), INDEX, '한미약품 계열사 소식')).toEqual({
+      action: 'drop', reason: 'no-corp-match',
+    })
+  })
+
+  it('critical 키워드가 description에만 있으면 critical로 올리지 않는다', () => {
+    // 실측: "맥쿼리 가비아 공개매수 무산" 이 본문의 '상장폐지' 로 critical 이 됐다.
+    expect(evaluateNews(ev('한미약품 공개매수 무산'), INDEX, '상장폐지 가능성도 거론된다')).toEqual({
+      action: 'drop', reason: 'no-keyword-match',
+    })
+  })
+
+  it('critical 키워드가 제목에 있으면 critical이다', () => {
+    expect(evaluateNews(ev('한미약품, 200억 규모 유상증자 실시'), INDEX, ''))
+      .toMatchObject({ action: 'pass', tier: 'critical' })
+  })
+
+  it('high 키워드는 description에만 있어도 판정에 쓴다', () => {
     const v = evaluateNews(ev('한미약품 관련 소식'), INDEX, '오늘 대규모 수주를 발표했다')
     expect(v).toMatchObject({ action: 'pass' })
   })
@@ -485,23 +511,33 @@ function squash(s: string): string {
 export function evaluateNews(
   event: NormalizedEvent, index: CorpIndex, description: string,
 ): Verdict {
-  const text = `${event.title} ${description}`
-
-  // 게이트 1 — 종목 연결. **원문으로 매칭한다.** 공백을 지우면 단어 경계를 넘어
-  // 없던 회사명이 만들어진다 — "삼성 전자제품" → "삼성전자제품" 은 "삼성전자" 를
-  // 포함하고, "현대 차량" 은 "현대차" 를 포함한다. 종목명은 표현 변형이 거의 없어
-  // squash 로 얻을 것도 없다.
+  // 게이트 1 — 종목 연결. **제목에서만, 공백을 지우지 않고** 찾는다.
+  //
+  // 제목으로 한정하는 이유는 실측이다(기사 461건). 본문까지 보면 통과분의 절반이
+  // 제목에 종목명이 없었고, 그중에는 본문의 모회사가 제목의 실제 주체를 밀어낸
+  // 오귀속이 있었다 — "한섬, 자사주 매입·소각" 이 현대백화점으로 잡혔다. 발송
+  // 메시지가 제목과 링크뿐이라, 제목에 없는 회사로 알림이 나가면 설명이 안 된다.
+  //
+  // squash 하지 않는 이유는 공백을 지우면 단어 경계를 넘어 없던 회사명이 만들어지기
+  // 때문이다 — "삼성 전자제품" → "삼성전자제품" 은 "삼성전자" 를 포함하고,
+  // "현대 차량" 은 "현대차" 를 포함한다. 종목명은 표현 변형이 거의 없어 얻을 것도 없다.
   //
   // 매크로 트랙(3c)이 붙기 전까지 여기서 막힌 것은 전부 drop 이지만, events 에는
-  // 그대로 기록되어 3c 튜닝 근거가 된다.
-  const corp = matchCorp(text, index)
+  // 그대로 기록되어 3c·3d 튜닝 근거가 된다.
+  const corp = matchCorp(event.title, index)
   if (!corp) return { action: 'drop', reason: 'no-corp-match' }
 
   // 게이트 2 — 영향 키워드. 이쪽은 squash 한다. 뉴스 제목이 자유 형식이라
   // `계약 체결` 과 `계약체결` 을 같게 봐야 한다.
-  const squashed = squash(text)
+  const titleSq = squash(event.title)
+  const fullSq = squash(`${event.title} ${description}`)
   for (const { tier, words } of NEWS_TIERS) {
-    const hit = words.find((w) => squashed.includes(squash(w)))
+    // critical 만 제목으로 한정한다. 실측 최악의 오탐이 이 티어였다 — "맥쿼리 가비아
+    // 공개매수 무산" 이 본문의 '상장폐지' 때문에 critical 로 나갔다. critical 은 병합을
+    // 건너뛰고 즉시 발송되므로 틀렸을 때 가장 비싸다. high/normal 은 본문을 쓴다 —
+    // 제목만으로는 "3분기 실적 발표" 가 호실적인지 어닝쇼크인지 알 수 없다.
+    const haystack = tier === 'critical' ? titleSq : fullSq
+    const hit = words.find((w) => haystack.includes(squash(w)))
     if (hit) return { action: 'pass', tier, rule: `keyword:${hit}` }
   }
 
