@@ -78,6 +78,28 @@ export type CycleState = {
 
 export type CycleResult = CycleState & { sleepMs: number }
 
+/**
+ * 다음 사이클까지 잘 시간. **성공하든 실패하든 규칙은 하나다** — 소스별
+ * nextRunAt 중 가장 이른 것에 맞춘다.
+ *
+ * 예산 감속도 실패 백오프도 이미 각 소스의 nextRunAt 에 들어가 있다. 여기에
+ * 사이클 단위 배수를 다시 곱하면 실패한 소스는 두 번 밀리고, 멀쩡한 소스는
+ * 남의 장애 때문에 폴링이 멎는다 — DART 만 주기가 된 사이클에서 DART 가
+ * 실패하면 사이클 전체가 10분을 자고, 자기 주기가 60초인 뉴스가 그 10분 동안
+ * 한 번도 돌지 않았다(실측: 98분에 33회, 정상이면 98회).
+ *
+ * 소스가 하나뿐이면 이 값은 `plan.intervalMs(now) * 그 소스의 배수` 이므로
+ * 기존 실패 경로의 `pollIntervalMs(now) * multiplier` 와 같은 수다.
+ *
+ * 1초 하한은 주기가 0 이하로 잡힌 소스가 루프를 바쁘게 돌리는 것을 막는다.
+ * 소스가 하나도 없으면 Math.min() 이 Infinity 라 영원히 잠든다 — 폴백을 둔다.
+ */
+function sleepUntilSoonest(nextRunAt: ReadonlyMap<string, number>, now: Date): number {
+  const deltas = [...nextRunAt.values()].map((t) => t - now.getTime())
+  const soonest = deltas.length > 0 ? Math.min(...deltas) : pollIntervalMs(now)
+  return Math.max(soonest, 1_000)
+}
+
 export async function runCycle(
   deps: CycleDeps, state: CycleState, now: Date,
 ): Promise<CycleResult> {
@@ -260,14 +282,7 @@ export async function runCycle(
     lastDigestDate = caughtUp.lastDigestDate
     digestAttempt = caughtUp.digestAttempt
 
-    // 다음에 깨어나야 할 가장 이른 시각에 맞춘다 — 가장 짧은 주기의 소스를
-    // 놓치지 않으려면 그쪽 기준이어야 한다. 예산 감속도 실패 백오프도 이미
-    // 소스별 nextRunAt 에 반영돼 있으므로 여기서 다시 곱하지 않는다. 1초 하한은
-    // 주기가 0 이하로 잡힌 소스가 루프를 바쁘게 돌리는 것을 막는다.
-    const deltas = [...nextRunAt.values()].map((t) => t - now.getTime())
-    // 소스가 하나도 없으면 Math.min() 이 Infinity 라 영원히 잠든다.
-    const soonest = deltas.length > 0 ? Math.min(...deltas) : pollIntervalMs(now)
-    sleepMs = Math.max(soonest, 1_000)
+    sleepMs = sleepUntilSoonest(nextRunAt, now)
   } catch (err) {
     deps.circuit.recordFailure()
     const failures = deps.circuit.consecutiveFailures()
@@ -288,7 +303,11 @@ export async function runCycle(
       }
     }
 
-    sleepMs = pollIntervalMs(new Date()) * deps.circuit.intervalMultiplier()
+    // 실패 경로도 같은 규칙이다. 실패한 소스는 이미 자기 배수만큼 nextRunAt 이
+    // 밀려 있고, 수집 바깥(발송·다이제스트)에서 터진 실패라면 소스들의
+    // nextRunAt 은 이번 사이클 몫으로 정상 설정돼 있다. 사이클 단위 배수를
+    // 여기서 다시 얹으면 멀쩡한 소스까지 같이 멈춘다.
+    sleepMs = sleepUntilSoonest(nextRunAt, now)
   } finally {
     // heartbeat 은 반드시 finally 에 둔다. "프로세스가 살아 루프를 돌고 있는가"에
     // 답하는 신호이고, 그 답은 DART 성공 여부와 무관하기 때문이다.

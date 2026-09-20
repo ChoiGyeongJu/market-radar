@@ -568,6 +568,60 @@ describe('runCycle — 다중 소스', () => {
       // 두 채널이 같은 객체라 그 구분을 검증할 수 없다.
     })
 
+    it('고장난 소스만 주기가 된 사이클이 멀쩡한 소스의 폴링까지 멈추지 않는다', async () => {
+      // 실측 회귀: 실패 경로가 사이클 단위 배수로 잠들면 DART 만 주기가 된
+      // 사이클에서 10분을 자 버려, 자기 주기가 60초인 뉴스가 98분 동안 33회밖에
+      // 돌지 못했다. 스케줄러가 돌려준 sleepMs 로 시간을 진행시켜 그 궤적을 그대로 돈다.
+      const dart = fakePlan('dart', 10_000)
+      breakSource(dart, 'DART down')
+      const news = fakePlan('news', 60_000)
+      const deps = depsWith([dart, news])
+
+      const start = MULTI_NOW.getTime()
+      const end = start + 98 * 60_000
+      let t = start
+      let state = initialState([dart, news])
+      let cycles = 0
+      while (t < end && cycles < 500) {
+        const { sleepMs, ...next } = await runCycle(deps, state, new Date(t))
+        state = next
+        t += sleepMs
+        cycles += 1
+      }
+
+      // 뉴스는 자기 주기(60초)대로 98분에 90회 이상 — 33회로 주저앉으면 회귀다.
+      expect(news.source.fetchLatest.mock.calls.length).toBeGreaterThanOrEqual(90)
+      // 고장난 소스는 자기 백오프(최대 32배 = 320초)만큼만 뜸해진다.
+      expect(dart.source.fetchLatest.mock.calls.length).toBeLessThan(40)
+      expect(dart.source.fetchLatest.mock.calls.length).toBeGreaterThan(10)
+    })
+
+    it('소스가 하나뿐이면 실패 백오프는 기존과 같다 — pollIntervalMs × 배수', async () => {
+      const source = {
+        id: 'dart',
+        fetchLatest: vi.fn(async (): Promise<NormalizedEvent[]> => { throw new Error('DART down') }),
+      }
+      // 운영과 같은 구성: 주기가 곧 pollIntervalMs 다.
+      const only: SourcePlan = {
+        source,
+        evaluate: (): Verdict => ({ action: 'drop', reason: 'test' }),
+        intervalMs: pollIntervalMs,
+        countsAgainstApiBudget: true,
+      }
+      const deps = depsWith([only])
+      const base = pollIntervalMs(MULTI_NOW) // 월요일 장중 = 10초
+
+      let state = initialState([only])
+      let t = MULTI_NOW.getTime()
+      // 서킷 배수는 2,4,8,16,32 로 오르고 32 에서 멈춘다(core/circuit.ts).
+      for (const multiplier of [2, 4, 8, 16, 32, 32]) {
+        const { sleepMs, ...next } = await runCycle(deps, state, new Date(t))
+        expect(sleepMs).toBe(base * multiplier)
+        state = next
+        t += sleepMs
+      }
+    })
+
     it('예산 가드는 예산 있는 소스의 주기에만 걸린다', async () => {
       const dart = fakePlan('dart', 10_000, true)
       const news = fakePlan('news', 30_000, false)
