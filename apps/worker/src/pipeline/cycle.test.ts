@@ -2,6 +2,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import type { NormalizedEvent, Verdict } from '@app/shared'
 import { kstDateString } from '../core/budget.js'
 import { createCircuit, ALERT_THRESHOLD } from '../core/circuit.js'
+import type { Circuit } from '../core/circuit.js'
 import { evaluateDart } from '../core/dart/rules.js'
 import { pollIntervalMs } from '../core/schedule.js'
 import { createSeenSet } from '../core/seen.js'
@@ -305,10 +306,25 @@ describe('runCycle — 다중 소스', () => {
     }
   }
 
+  /**
+   * 진짜 서킷을 감싼 스파이. 연속 실패 횟수 계산은 실제 구현 그대로 두고
+   * 호출 여부만 본다 — 임의의 스텁으로 바꾸면 알림 임계값 동작이 달라진다.
+   */
+  function spyCircuit(): Circuit {
+    const circuit = createCircuit()
+    return {
+      recordSuccess: vi.fn(circuit.recordSuccess),
+      recordFailure: vi.fn(circuit.recordFailure),
+      consecutiveFailures: () => circuit.consecutiveFailures(),
+      intervalMultiplier: () => circuit.intervalMultiplier(),
+    }
+  }
+
   function depsWith(plans: readonly SourcePlan[]): CycleDeps {
     const store = {
       incrementApiUsage: vi.fn(async () => 1),
-      claimPending: async () => [],
+      // runDispatch 가 가장 먼저 부르는 것이라 "발송 단계까지 갔는가"의 신호가 된다.
+      claimPending: vi.fn(async () => []),
     } as unknown as EventStore
     const notifier: Notifier = { send: vi.fn(async () => ({ ok: true }) as const) }
     return {
@@ -318,7 +334,7 @@ describe('runCycle — 다중 소스', () => {
       operatorNotifier: notifier,
       summarizer,
       heartbeat: { ping: vi.fn(async () => true) },
-      circuit: createCircuit(),
+      circuit: spyCircuit(),
       log: silentLog(),
       dailyLimit: 20_000,
     }
@@ -375,5 +391,76 @@ describe('runCycle — 다중 소스', () => {
     const deps = depsWith([a, b])
     const state = await runCycle(deps, initialState([a, b]), new Date('2026-09-21T01:00:00Z'))
     expect(state.seen.get('dart')).not.toBe(state.seen.get('news'))
+  })
+
+  /**
+   * 사이클 실패는 **폴링한 소스가 전부 실패했을 때**만이다. 뉴스 피드 하나가
+   * 죽었다고 던지면 runDispatch 를 건너뛰어 이미 outbox 에서 대기 중이던 공시
+   * 알림까지 밀리고, 서킷 브레이커가 폴링을 늘리며 운영자를 호출한다.
+   */
+  describe('부분 실패는 사이클 실패가 아니다', () => {
+    it('한 소스만 실패하면 발송은 그대로 진행되고 성공으로 기록된다', async () => {
+      const bad = fakePlan('news', 10_000)
+      bad.source.fetchLatest = vi.fn().mockRejectedValue(new Error('RSS down'))
+      const good = fakePlan('dart', 10_000)
+      const deps = depsWith([good, bad])
+
+      await runCycle(deps, initialState([good, bad]), MULTI_NOW)
+
+      // 발송 단계까지 갔다 — outbox 의 공시 알림이 뉴스 장애에 묶이지 않는다.
+      expect(deps.store.claimPending).toHaveBeenCalledTimes(1)
+      expect(deps.circuit.recordSuccess).toHaveBeenCalledTimes(1)
+      expect(deps.circuit.recordFailure).not.toHaveBeenCalled()
+      // 부분 실패도 반드시 남는다 — 조용히 넘어가면 뉴스 수집이 멎은 줄 모른다.
+      expect(deps.log.error).toHaveBeenCalledWith(
+        expect.objectContaining({ sourceId: 'news' }),
+        'source ingest failed',
+      )
+    })
+
+    it('폴링한 소스가 전부 실패하면 사이클 실패다 — 발송도 건너뛴다', async () => {
+      const a = fakePlan('dart', 10_000)
+      a.source.fetchLatest = vi.fn().mockRejectedValue(new Error('DART down'))
+      const b = fakePlan('news', 10_000)
+      b.source.fetchLatest = vi.fn().mockRejectedValue(new Error('RSS down'))
+      const deps = depsWith([a, b])
+
+      await runCycle(deps, initialState([a, b]), MULTI_NOW)
+
+      expect(deps.circuit.recordFailure).toHaveBeenCalledTimes(1)
+      expect(deps.circuit.recordSuccess).not.toHaveBeenCalled()
+      expect(deps.store.claimPending).not.toHaveBeenCalled()
+      expect(deps.log.error).toHaveBeenCalledWith(
+        expect.objectContaining({ failures: 1 }),
+        'cycle failed',
+      )
+    })
+
+    it('소스가 하나뿐이면 그 하나의 실패가 곧 전면 실패다 — 기존 동작 그대로', async () => {
+      const only = fakePlan('dart', 10_000)
+      only.source.fetchLatest = vi.fn().mockRejectedValue(new Error('DART down'))
+      const deps = depsWith([only])
+
+      await runCycle(deps, initialState([only]), MULTI_NOW)
+
+      expect(deps.circuit.recordFailure).toHaveBeenCalledTimes(1)
+      expect(deps.circuit.recordSuccess).not.toHaveBeenCalled()
+      expect(deps.store.claimPending).not.toHaveBeenCalled()
+    })
+
+    it('주기 미달로 아무 소스도 안 본 사이클은 실패가 아니다', async () => {
+      const a = fakePlan('dart', 10_000)
+      const b = fakePlan('news', 60_000)
+      const deps = depsWith([a, b])
+
+      // 첫 사이클에서 둘 다 보고, 같은 시각에 한 번 더 돈다 — 둘 다 주기 미달이다.
+      const state = await runCycle(deps, initialState([a, b]), MULTI_NOW)
+      await runCycle(deps, state, MULTI_NOW)
+
+      expect(a.source.fetchLatest).toHaveBeenCalledTimes(1)
+      expect(b.source.fetchLatest).toHaveBeenCalledTimes(1)
+      expect(deps.circuit.recordFailure).not.toHaveBeenCalled()
+      expect(deps.circuit.recordSuccess).toHaveBeenCalledTimes(2)
+    })
   })
 })

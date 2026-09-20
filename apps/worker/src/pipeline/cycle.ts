@@ -86,6 +86,10 @@ export async function runCycle(
   let sleepMs: number
 
   try {
+    // 이번 사이클에 실제로 폴링한 소스 수와 그중 실패한 수. 주기 미달로
+    // 건너뛴 소스는 어느 쪽에도 세지 않는다 — 보지 않은 소스는 성공도 실패도 아니다.
+    let ranCount = 0
+    let failedCount = 0
     // 첫 실패 원인. 바깥 catch 의 'cycle failed' 로그가 래퍼 에러만 남기면
     // 근본 원인이 그 줄에서 사라지므로 cause 로 달아 보낸다.
     let firstError: unknown = null
@@ -97,6 +101,7 @@ export async function runCycle(
       const id = plan.source.id
       if ((nextRunAt.get(id) ?? 0) > now.getTime()) continue
       nextRunAt.set(id, now.getTime() + plan.intervalMs(now))
+      ranCount += 1
 
       try {
         // 한도가 있는 소스만 센다. RSS 를 세면 DART 예산 가드가 엉뚱하게 발동해
@@ -123,16 +128,33 @@ export async function runCycle(
       } catch (err) {
         // 한 소스의 장애가 다른 소스의 수집을 막으면 안 된다. 서킷 브레이커는
         // 바깥 catch 가 담당하므로 여기서는 기록만 한다.
+        // 다른 소스가 성공해 사이클 전체는 성공으로 끝나더라도 이 줄은 반드시
+        // 남긴다. 조용한 부분 실패는 아무도 모르는 사이 한 소스의 수집이
+        // 통째로 멎는 방식이다.
         deps.log.error({ err, sourceId: id }, 'source ingest failed')
+        failedCount += 1
         if (firstError === null) firstError = err
       }
     }
 
-    // 한 소스라도 실패하면 사이클 실패다. 여기서 삼키면 전면 장애에도 서킷
-    // 브레이커가 돌지 않아 연속 실패 알림이 0건 간다. 던지는 위치도 그대로여야
-    // 한다 — 수집이 실패한 사이클에서 발송·다이제스트를 건너뛰는 기존 동작이다.
-    if (firstError !== null) {
-      throw new Error('one or more sources failed', { cause: firstError })
+    // **이번에 폴링한 소스가 전부 실패했을 때만** 사이클 실패로 던진다.
+    //
+    // 하나라도 살아 있으면 던지면 안 된다 — 던지는 순간 아래 runDispatch 를
+    // 건너뛰어 **이미 outbox 에 들어가 발송을 기다리던 공시 알림까지 밀리고**,
+    // 서킷 브레이커가 폴링 주기를 최대 32배로 늘리며 연속 실패 알림이 운영자를
+    // 호출한다. 뉴스 피드 하나가 죽었다는 이유로 공시 알림을 멈추고 사람을
+    // 부르는 것은 명백히 과잉이다.
+    //
+    // 그렇다고 전부 삼켜서도 안 된다. 전면 장애(DART·DB 동시 불통)에도 서킷
+    // 브레이커가 돌지 않으면 연속 실패 알림이 0건 가고, 워커는 백오프 없이
+    // 죽은 API 를 계속 두드린다. 던지는 위치도 그대로여야 한다 — 수집이 전부
+    // 실패한 사이클에서 발송·다이제스트를 건너뛰는 기존 동작이다.
+    //
+    // 소스가 하나뿐인 현재 운영 구성에서는 "하나 실패 = 전부 실패"라 동작이
+    // 이전과 완전히 같다. ranCount 가 0 인 사이클(전부 주기 미달)은 실패가
+    // 아니다 — 아무것도 보지 않았을 뿐이다.
+    if (ranCount > 0 && failedCount === ranCount) {
+      throw new Error('all polled sources failed', { cause: firstError })
     }
 
     const dispatch = await runDispatch(
