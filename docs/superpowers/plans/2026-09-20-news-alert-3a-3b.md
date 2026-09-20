@@ -367,6 +367,10 @@ const ev = (title: string): NormalizedEvent => ({
 })
 
 describe('evaluateNews', () => {
+  it('표현 변형은 키워드에서만 흡수한다 — 종목명은 원문', () => {
+    expect(evaluateNews(ev('한미약품 계약 체결'), INDEX, '')).toMatchObject({ action: 'pass' })
+  })
+
   it('종목이 안 잡히면 drop한다', () => {
     expect(evaluateNews(ev('오늘 서울 날씨 맑음'), INDEX, '')).toEqual({
       action: 'drop', reason: 'no-corp-match',
@@ -393,6 +397,13 @@ describe('evaluateNews', () => {
   it('description에만 있는 키워드도 판정에 쓴다', () => {
     const v = evaluateNews(ev('한미약품 관련 소식'), INDEX, '오늘 대규모 수주를 발표했다')
     expect(v).toMatchObject({ action: 'pass' })
+  })
+
+  it('공백을 지워 없던 종목명을 만들지 않는다', () => {
+    // squash 를 종목 매칭에 쓰면 "삼성 전자제품" 이 "삼성전자제품" 이 되어
+    // "삼성전자" 를 포함하게 된다. 종목 매칭은 원문으로 한다.
+    const v = evaluateNews(ev('삼성 전자제품 수주 계약'), INDEX, '')
+    expect(v).toEqual({ action: 'drop', reason: 'no-corp-match' })
   })
 
   it('모호한 종목명은 문맥 신호가 있어야 통과한다', () => {
@@ -474,16 +485,23 @@ function squash(s: string): string {
 export function evaluateNews(
   event: NormalizedEvent, index: CorpIndex, description: string,
 ): Verdict {
-  const haystack = squash(`${event.title} ${description}`)
+  const text = `${event.title} ${description}`
 
-  // 게이트 1 — 종목 연결. 매크로 트랙(3c)이 붙기 전까지 여기서 막힌 것은
-  // 전부 drop 이지만, events 에는 그대로 기록되어 3c 튜닝 근거가 된다.
-  const corp = matchCorp(haystack, index)
+  // 게이트 1 — 종목 연결. **원문으로 매칭한다.** 공백을 지우면 단어 경계를 넘어
+  // 없던 회사명이 만들어진다 — "삼성 전자제품" → "삼성전자제품" 은 "삼성전자" 를
+  // 포함하고, "현대 차량" 은 "현대차" 를 포함한다. 종목명은 표현 변형이 거의 없어
+  // squash 로 얻을 것도 없다.
+  //
+  // 매크로 트랙(3c)이 붙기 전까지 여기서 막힌 것은 전부 drop 이지만, events 에는
+  // 그대로 기록되어 3c 튜닝 근거가 된다.
+  const corp = matchCorp(text, index)
   if (!corp) return { action: 'drop', reason: 'no-corp-match' }
 
-  // 게이트 2 — 영향 키워드
+  // 게이트 2 — 영향 키워드. 이쪽은 squash 한다. 뉴스 제목이 자유 형식이라
+  // `계약 체결` 과 `계약체결` 을 같게 봐야 한다.
+  const squashed = squash(text)
   for (const { tier, words } of NEWS_TIERS) {
-    const hit = words.find((w) => haystack.includes(squash(w)))
+    const hit = words.find((w) => squashed.includes(squash(w)))
     if (hit) return { action: 'pass', tier, rule: `keyword:${hit}` }
   }
 
@@ -1819,6 +1837,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # ubuntu-latest 에 postgresql-client 가 있다고 가정하지 않는다. 없으면 백업이
+      # 조용히 실패하는데, 백업은 실패를 알아차리기 가장 어려운 종류의 작업이다.
+      - name: Ensure psql
+        run: psql --version || (sudo apt-get update && sudo apt-get install -y postgresql-client)
       - name: Dump events
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
