@@ -812,16 +812,22 @@ export type FeedConfig = {
 }
 
 /**
- * 실측(스펙 §4.2)으로 살아 있음을 확인한 피드들. 조건부 요청 지원 여부가
- * 폴링 주기를 가른다 — 미지원 매체를 짧게 폴링하면 매번 전문을 받는다.
+ * 실측(스펙 §4.2)으로 살아 있음을 확인한 피드들. **확인은 Node 의 기본 TLS 설정으로
+ * 했다** — curl 이나 검증을 끈 클라이언트로 되는 것이 워커에서 된다는 보장이 없다.
+ * 조건부 요청 지원 여부가 폴링 주기를 가른다 — 미지원 매체를 짧게 폴링하면 매번
+ * 전문을 받는다.
  */
 export const FEEDS: readonly FeedConfig[] = [
-  { id: 'yna-eco', press: '연합뉴스', url: 'https://www.yna.co.kr/rss/economy.xml' },
-  { id: 'edaily', press: '이데일리', url: 'https://rss.edaily.co.kr/edaily_news.xml' },
+  { id: 'yna-market', press: '연합뉴스', url: 'https://www.yna.co.kr/rss/market.xml' },
   { id: 'mt', press: '머니투데이', url: 'https://rss.mt.co.kr/mt_news.xml' },
   { id: 'hk-fin', press: '한국경제', url: 'https://www.hankyung.com/feed/finance' },
+  { id: 'chosunbiz', press: '조선비즈', url: 'https://biz.chosun.com/arc/outboundfeeds/rss/category/stock/?outputType=xml' },
   { id: 'mk-stock', press: '매일경제', url: 'https://www.mk.co.kr/rss/50200011/' },
 ]
+
+// 이데일리는 넣지 않는다. rss.edaily.co.kr 이 TLS 1.0 으로만 협상하는데 Node 의
+// 기본 최소 버전은 TLS 1.2 라 ERR_SSL_UNSUPPORTED_PROTOCOL 로 실패한다. 피드 하나를
+// 얻자고 워커 전체의 TLS 바닥을 폐기된 프로토콜(RFC 8996)까지 내리지 않는다. 스펙 §4.2.
 
 export type RssSourceConfig = {
   feeds: readonly FeedConfig[]
