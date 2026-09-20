@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest'
 import type { NormalizedEvent } from '@app/shared'
-import { escapeMarkdownV2, formatEvent, formatMerged, DISCLAIMER } from './format.js'
+import { escapeMarkdownV2, formatEvent, formatMerged, formatNewsEvent, formatNewsMerged, DISCLAIMER } from './format.js'
 
 const e: NormalizedEvent = {
   sourceId: 'dart',
@@ -105,5 +105,56 @@ describe('escape invariant — 예약문자 누락 감지', () => {
     expect(msg).not.toContain('rcpNo=20260919000123')
     expect(msg).not.toContain('rcpNo=20260919000456')
     expect(msg).not.toContain('main.do?')
+  })
+})
+
+const newsEvent = (title: string): NormalizedEvent => ({
+  sourceId: 'news', externalId: 'yna-eco:1', occurredAt: new Date('2026-09-20T09:05:00Z'),
+  firstSeenAt: new Date('2026-09-20T09:10:00Z'), title,
+  url: 'https://example.com/a', raw: { feedId: 'yna-eco', press: '연합뉴스' },
+})
+
+describe('formatNewsEvent', () => {
+  it('제목·매체·링크를 담는다', () => {
+    const s = formatNewsEvent(newsEvent('한미약품 수주 계약'), 'high')
+    expect(s).toContain('한미약품 수주 계약')
+    expect(s).toContain('연합뉴스')
+    expect(s).toContain(escapeMarkdownV2('https://example.com/a'))
+  })
+
+  it('면책 문구를 붙인다', () => {
+    expect(formatNewsEvent(newsEvent('제목'), 'high')).toContain(DISCLAIMER)
+  })
+
+  it('MarkdownV2 특수문자를 이스케이프한다', () => {
+    const s = formatNewsEvent(newsEvent('한미약품 (주) 수주 - 1분기'), 'high')
+    expect(s).toContain('\\(')
+    expect(s).toContain('\\-')
+  })
+
+  it('press가 없으면 매체 줄을 생략한다 — 빈 라벨을 찍지 않는다', () => {
+    const e = { ...newsEvent('제목'), raw: {} }
+    expect(formatNewsEvent(e, 'high')).not.toContain('출처')
+  })
+
+  it('subject가 없어도 undefined가 새지 않는다', () => {
+    expect(formatNewsEvent(newsEvent('제목'), 'high')).not.toContain('undefined')
+  })
+})
+
+describe('formatNewsMerged', () => {
+  it('헤더가 공시가 아니라 뉴스다', () => {
+    const s = formatNewsMerged([{ event: newsEvent('가'), tier: 'high' }])
+    expect(s).toContain('뉴스 1건')
+    expect(s).not.toContain('공시')
+  })
+
+  it('subject가 없어도 undefined가 새지 않는다 — formatMerged 를 그대로 쓰면 터지는 지점', () => {
+    const s = formatNewsMerged([
+      { event: newsEvent('가'), tier: 'high' },
+      { event: newsEvent('나'), tier: 'normal' },
+    ])
+    expect(s).not.toContain('undefined')
+    expect(s).toContain('연합뉴스')
   })
 })
