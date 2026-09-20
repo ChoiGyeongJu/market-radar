@@ -1,5 +1,5 @@
 import { budgetGuard, kstDateString } from '../core/budget.js'
-import { ALERT_THRESHOLD } from '../core/circuit.js'
+import { ALERT_THRESHOLD, createCircuit } from '../core/circuit.js'
 import type { Circuit } from '../core/circuit.js'
 import { pollIntervalMs } from '../core/schedule.js'
 import { createSeenSet } from '../core/seen.js'
@@ -43,6 +43,11 @@ export type CycleDeps = {
   operatorNotifier: Notifier
   summarizer: Summarizer
   heartbeat: Heartbeat
+  /**
+   * 사이클 자체의 서킷. 수집 **바깥**(발송·다이제스트)에서 터진 실패와 전면
+   * 수집 실패의 백오프를 담당한다. 소스별 건강 상태는 소스마다 따로 가진
+   * 서킷이 본다 (CycleState.circuits).
+   */
   circuit: Circuit
   log: CycleLogger
   /** 계정에 발급된 일일 한도. budgetGuard 와 다이제스트 분모에 그대로 흘러간다. */
@@ -63,6 +68,12 @@ export type CycleState = {
   coldStart: Map<string, boolean>
   /** 소스별 다음 실행 시각(ms). 주기가 서로 다르다. */
   nextRunAt: Map<string, number>
+  /**
+   * 소스별 서킷 브레이커. 하나를 공유하면 건강한 소스의 성공이 아픈 소스의
+   * 연속 실패 카운터를 매 사이클 0 으로 되돌려, DART 가 완전히 죽어도 임계값에
+   * 닿지 못하고 운영자 알림이 영영 0건 간다. 백오프도 같은 이유로 소스별이다.
+   */
+  circuits: Map<string, Circuit>
 }
 
 export type CycleResult = CycleState & { sleepMs: number }
@@ -81,9 +92,11 @@ export async function runCycle(
   const seen = new Map(state.seen)
   const coldStart = new Map(state.coldStart)
   const nextRunAt = new Map(state.nextRunAt)
-  // 예산 가드에 넘길 사용량. 한도를 추적하는 소스가 올려준 값만 들어간다.
-  let used = 0
+  const circuits = new Map(state.circuits)
   let sleepMs: number
+  // 수집 전체가 실패해 던졌는가. 바깥 catch 가 알림을 한 번 더 보내지 않도록
+  // 구분한다 — 소스별 알림이 이미 나갔다.
+  let allSourcesFailed = false
 
   try {
     // 이번 사이클에 실제로 폴링한 소스 수와 그중 실패한 수. 주기 미달로
@@ -95,19 +108,38 @@ export async function runCycle(
     let firstError: unknown = null
     const ingested: Array<{
       sourceId: string; stats: IngestStats; wasColdStart: boolean; seenSize: number
+      /** 이 소스의 오늘 누적 호출 수. 한도를 추적하지 않는 소스는 null. */
+      used: number | null
     }> = []
 
     for (const plan of deps.plans) {
       const id = plan.source.id
       if ((nextRunAt.get(id) ?? 0) > now.getTime()) continue
-      nextRunAt.set(id, now.getTime() + plan.intervalMs(now))
+      const baseIntervalMs = plan.intervalMs(now)
+      nextRunAt.set(id, now.getTime() + baseIntervalMs)
       ranCount += 1
 
+      // 처음 보는 소스의 서킷은 여기서 만든다. 소스마다 따로 두는 이유는
+      // CycleState.circuits 주석 참고.
+      let circuit = circuits.get(id)
+      if (circuit === undefined) {
+        circuit = createCircuit()
+        circuits.set(id, circuit)
+      }
+
+      let sourceUsed: number | null = null
       try {
         // 한도가 있는 소스만 센다. RSS 를 세면 DART 예산 가드가 엉뚱하게 발동해
         // 폴링 주기가 2~10배로 늘어진다.
         if (plan.countsAgainstApiBudget) {
-          used = await deps.store.incrementApiUsage(id, kstDate)
+          sourceUsed = await deps.store.incrementApiUsage(id, kstDate)
+          // 예산 가드는 **이 소스 자신의 주기**에 건다. 사이클 전체 sleepMs 에만
+          // 걸면 주기가 더 짧은 비예산 소스가 먼저 깨우는 순간 DART 가 원래
+          // 주기로 다시 떠서 가드가 사실상 무력화된다 — 한도 초과로 020 을 맞아
+          // 서비스가 통째로 멈추는 것이 최악의 실패다(core/budget.ts 주석).
+          nextRunAt.set(
+            id, now.getTime() + budgetGuard(sourceUsed, baseIntervalMs, deps.dailyLimit),
+          )
         }
         // 처음 보는 소스는 콜드 스타트로 친다 — 새로 붙인 소스도 첫 사이클은
         // 기록만 하고 한 건도 발송하지 않아야 한다.
@@ -119,21 +151,44 @@ export async function runCycle(
         )
         seen.set(id, ingest.state.seen)
         coldStart.set(id, ingest.state.coldStart)
+        // 자기 서킷만 되돌린다. 남의 카운터를 건드리면 아픈 소스의 장애가
+        // 건강한 소스의 성공에 덮여 사라진다.
+        circuit.recordSuccess()
         ingested.push({
           sourceId: id,
           stats: ingest.stats,
           wasColdStart,
           seenSize: ingest.state.seen.size,
+          used: sourceUsed,
         })
       } catch (err) {
-        // 한 소스의 장애가 다른 소스의 수집을 막으면 안 된다. 서킷 브레이커는
-        // 바깥 catch 가 담당하므로 여기서는 기록만 한다.
+        // 한 소스의 장애가 다른 소스의 수집을 막으면 안 된다.
         // 다른 소스가 성공해 사이클 전체는 성공으로 끝나더라도 이 줄은 반드시
         // 남긴다. 조용한 부분 실패는 아무도 모르는 사이 한 소스의 수집이
         // 통째로 멎는 방식이다.
         deps.log.error({ err, sourceId: id }, 'source ingest failed')
         failedCount += 1
         if (firstError === null) firstError = err
+
+        circuit.recordFailure()
+        const failures = circuit.consecutiveFailures()
+
+        // 백오프도 소스별이다. 아픈 소스의 다음 실행만 뒤로 민다 — 사이클 전체
+        // sleepMs 를 늘리면 DART 장애가 멀쩡한 뉴스 폴링까지 몇 분씩 멈춰 세우고,
+        // DART 자신도 10초가 아니라 그 몇 분 뒤에야 재시도된다.
+        nextRunAt.set(id, now.getTime() + baseIntervalMs * circuit.intervalMultiplier())
+
+        // `=== ALERT_THRESHOLD` 로 두면 안 된다: 전면 장애(DART·텔레그램 동시 불통) 시
+        // 5회째의 단 한 번뿐인 발송이 조용히 실패하고 failures 는 6,7,8... 로 올라가
+        // 다시 5가 되지 않으므로 장애 전 구간에 알림이 0건 간다.
+        if (failures >= ALERT_THRESHOLD && failures % ALERT_THRESHOLD === 0) {
+          // 어느 소스가 죽었는지 이름을 붙인다. 소스가 둘 이상이면 "워커가
+          // 실패 중"이라는 말만으로는 운영자가 무엇을 봐야 할지 알 수 없다.
+          await deps.operatorNotifier.send(
+            `⚠️ [${id}] 워커 연속 실패 ${failures}회` +
+            (heartbeatFailures > 0 ? `\n⚠️ heartbeat 미확인 ${heartbeatFailures}회 — 감시망 점검 필요` : ''),
+          ).catch(() => {})
+        }
       }
     }
 
@@ -154,6 +209,7 @@ export async function runCycle(
     // 이전과 완전히 같다. ranCount 가 0 인 사이클(전부 주기 미달)은 실패가
     // 아니다 — 아무것도 보지 않았을 뿐이다.
     if (ranCount > 0 && failedCount === ranCount) {
+      allSourcesFailed = true
       throw new Error('all polled sources failed', { cause: firstError })
     }
 
@@ -180,7 +236,7 @@ export async function runCycle(
       }
 
       if (r.stats.recorded > 0 || dispatch.sent > 0) {
-        deps.log.info({ sourceId: r.sourceId, ingest: r.stats, dispatch, used }, 'cycle')
+        deps.log.info({ sourceId: r.sourceId, ingest: r.stats, dispatch, used: r.used }, 'cycle')
       }
     }
 
@@ -205,25 +261,31 @@ export async function runCycle(
     digestAttempt = caughtUp.digestAttempt
 
     // 다음에 깨어나야 할 가장 이른 시각에 맞춘다 — 가장 짧은 주기의 소스를
-    // 놓치지 않으려면 그쪽 기준이어야 한다. 1초 하한은 주기가 0 이하로 잡힌
-    // 소스가 루프를 바쁘게 돌리는 것을 막는다.
+    // 놓치지 않으려면 그쪽 기준이어야 한다. 예산 감속도 실패 백오프도 이미
+    // 소스별 nextRunAt 에 반영돼 있으므로 여기서 다시 곱하지 않는다. 1초 하한은
+    // 주기가 0 이하로 잡힌 소스가 루프를 바쁘게 돌리는 것을 막는다.
     const deltas = [...nextRunAt.values()].map((t) => t - now.getTime())
     // 소스가 하나도 없으면 Math.min() 이 Infinity 라 영원히 잠든다.
     const soonest = deltas.length > 0 ? Math.min(...deltas) : pollIntervalMs(now)
-    sleepMs = budgetGuard(used, Math.max(soonest, 1_000), deps.dailyLimit)
+    sleepMs = Math.max(soonest, 1_000)
   } catch (err) {
     deps.circuit.recordFailure()
     const failures = deps.circuit.consecutiveFailures()
     deps.log.error({ err, failures }, 'cycle failed')
 
-    // `=== ALERT_THRESHOLD` 로 두면 안 된다: 전면 장애(DART·텔레그램 동시 불통) 시
-    // 5회째의 단 한 번뿐인 발송이 조용히 실패하고 failures 는 6,7,8... 로 올라가
-    // 다시 5가 되지 않으므로 장애 전 구간에 알림이 0건 간다.
-    if (failures >= ALERT_THRESHOLD && failures % ALERT_THRESHOLD === 0) {
-      await deps.operatorNotifier.send(
-        `⚠️ 워커 연속 실패 ${failures}회` +
-        (heartbeatFailures > 0 ? `\n⚠️ heartbeat 미확인 ${heartbeatFailures}회 — 감시망 점검 필요` : ''),
-      ).catch(() => {})
+    // 수집 실패는 소스별 알림이 이미 담당했다. 여기서 또 보내면 전면 장애 때
+    // 같은 사이클에 두 번 울린다 — 이 알림은 수집 바깥(발송·다이제스트)에서
+    // 터진 실패만 맡는다.
+    if (!allSourcesFailed) {
+      // `=== ALERT_THRESHOLD` 로 두면 안 된다: 전면 장애(DART·텔레그램 동시 불통) 시
+      // 5회째의 단 한 번뿐인 발송이 조용히 실패하고 failures 는 6,7,8... 로 올라가
+      // 다시 5가 되지 않으므로 장애 전 구간에 알림이 0건 간다.
+      if (failures >= ALERT_THRESHOLD && failures % ALERT_THRESHOLD === 0) {
+        await deps.operatorNotifier.send(
+          `⚠️ 워커 연속 실패 ${failures}회` +
+          (heartbeatFailures > 0 ? `\n⚠️ heartbeat 미확인 ${heartbeatFailures}회 — 감시망 점검 필요` : ''),
+        ).catch(() => {})
+      }
     }
 
     sleepMs = pollIntervalMs(new Date()) * deps.circuit.intervalMultiplier()
@@ -245,6 +307,7 @@ export async function runCycle(
     seen,
     coldStart,
     nextRunAt,
+    circuits,
   }
 }
 

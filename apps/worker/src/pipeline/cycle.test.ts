@@ -34,6 +34,7 @@ function warmState(heartbeatFailures = 0): CycleState {
     seen: new Map([['dart', createSeenSet(['20260919000100'])]]),
     coldStart: new Map([['dart', false]]),
     nextRunAt: new Map(),
+    circuits: new Map(),
   }
 }
 
@@ -320,9 +321,9 @@ describe('runCycle — 다중 소스', () => {
     }
   }
 
-  function depsWith(plans: readonly SourcePlan[]): CycleDeps {
+  function depsWith(plans: readonly SourcePlan[], apiUsage = 1): CycleDeps {
     const store = {
-      incrementApiUsage: vi.fn(async () => 1),
+      incrementApiUsage: vi.fn(async () => apiUsage),
       // runDispatch 가 가장 먼저 부르는 것이라 "발송 단계까지 갔는가"의 신호가 된다.
       claimPending: vi.fn(async () => []),
     } as unknown as EventStore
@@ -348,6 +349,7 @@ describe('runCycle — 다중 소스', () => {
       seen: new Map(plans.map((p) => [p.source.id, createSeenSet([])])),
       coldStart: new Map(plans.map((p) => [p.source.id, false])),
       nextRunAt: new Map(),
+      circuits: new Map(),
     }
   }
 
@@ -461,6 +463,124 @@ describe('runCycle — 다중 소스', () => {
       expect(b.source.fetchLatest).toHaveBeenCalledTimes(1)
       expect(deps.circuit.recordFailure).not.toHaveBeenCalled()
       expect(deps.circuit.recordSuccess).toHaveBeenCalledTimes(2)
+    })
+  })
+
+  /**
+   * Critical 회귀 — 서킷이 하나뿐이면 건강한 소스의 성공이 매 사이클
+   * recordSuccess() 로 연속 실패 카운터를 0 으로 되돌려, DART 가 완전히 죽어도
+   * ALERT_THRESHOLD(5)에 영영 닿지 못한다. 실측 시뮬레이션에서 203분 동안
+   * 최대 연속실패 1, 운영자 알림 0건이었다.
+   */
+  describe('서킷과 백오프는 소스마다 따로다', () => {
+    /** 어느 소스든 항상 실패하게 만든다. */
+    function breakSource(plan: ReturnType<typeof fakePlan>, msg: string) {
+      plan.source.fetchLatest = vi.fn(async () => { throw new Error(msg) })
+    }
+
+    it('건강한 소스가 있어도 죽은 소스의 연속 실패는 쌓여 알림이 나간다 — 소스 이름을 붙여서', async () => {
+      const dart = fakePlan('dart', 10_000)
+      breakSource(dart, 'DART down')
+      const news = fakePlan('news', 10_000)
+      const deps = depsWith([dart, news])
+      let state = initialState([dart, news])
+
+      // 백오프가 붙어도 항상 둘 다 주기가 되도록 넉넉히(10분씩) 민다.
+      for (let i = 0; i < ALERT_THRESHOLD; i += 1) {
+        const { sleepMs: _s, ...next } = await runCycle(
+          deps, state, new Date(MULTI_NOW.getTime() + i * 600_000),
+        )
+        state = next
+      }
+
+      // 건강한 소스는 자기 주기대로 계속 돈다 — 죽은 소스에 끌려가지 않는다.
+      expect(news.source.fetchLatest).toHaveBeenCalledTimes(ALERT_THRESHOLD)
+      expect(dart.source.fetchLatest).toHaveBeenCalledTimes(ALERT_THRESHOLD)
+
+      const sent = vi.mocked(deps.operatorNotifier.send)
+      expect(sent).toHaveBeenCalledTimes(1)
+      expect(sent.mock.calls[0]?.[0]).toContain('워커 연속 실패')
+      expect(sent.mock.calls[0]?.[0]).toContain('dart') // 어느 소스인지 이름이 있어야 한다
+      expect(sent.mock.calls[0]?.[0]).toContain(`${ALERT_THRESHOLD}회`)
+    })
+
+    it('건강한 소스의 성공이 죽은 소스의 카운터를 리셋하지 않는다', async () => {
+      const dart = fakePlan('dart', 10_000)
+      breakSource(dart, 'DART down')
+      const news = fakePlan('news', 10_000)
+      const deps = depsWith([dart, news])
+      let state = initialState([dart, news])
+
+      for (let i = 0; i < 3; i += 1) {
+        const { sleepMs: _s, ...next } = await runCycle(
+          deps, state, new Date(MULTI_NOW.getTime() + i * 600_000),
+        )
+        state = next
+      }
+
+      // 리셋됐다면 1 에서 머문다. 소스별 서킷이라야 3 이 된다.
+      expect(state.circuits.get('dart')?.consecutiveFailures()).toBe(3)
+      expect(state.circuits.get('news')?.consecutiveFailures()).toBe(0)
+    })
+
+    it('죽은 소스의 백오프가 건강한 소스의 주기를 늘리지 않는다', async () => {
+      const dart = fakePlan('dart', 10_000)
+      breakSource(dart, 'DART down')
+      const news = fakePlan('news', 30_000)
+      const deps = depsWith([dart, news])
+
+      const t0 = MULTI_NOW.getTime()
+      const first = await runCycle(deps, initialState([dart, news]), new Date(t0))
+      // dart 는 1회 실패 → 자기 주기만 2배(20초). news 는 그대로 30초.
+      expect(first.nextRunAt.get('dart')).toBe(t0 + 20_000)
+      expect(first.nextRunAt.get('news')).toBe(t0 + 30_000)
+      expect(first.sleepMs).toBe(20_000)
+
+      const t1 = t0 + 30_000
+      const { sleepMs: _s, ...state } = first
+      const second = await runCycle(deps, state, new Date(t1))
+
+      // dart 는 2회 실패 → 4배(40초)로 더 밀린다. news 는 여전히 30초 그대로이고
+      // 사이클의 sleep 도 news 기준이다 — 예전이라면 전체가 dart 백오프에 끌려갔다.
+      expect(second.nextRunAt.get('dart')).toBe(t1 + 40_000)
+      expect(second.nextRunAt.get('news')).toBe(t1 + 30_000)
+      expect(second.sleepMs).toBe(30_000)
+      expect(news.source.fetchLatest).toHaveBeenCalledTimes(2)
+    })
+
+    it('소스가 하나뿐일 때도 알림은 기존과 같이 5회째에 한 번 나간다', async () => {
+      const only = fakePlan('dart', 10_000)
+      breakSource(only, 'DART down')
+      const deps = depsWith([only])
+      let state = initialState([only])
+
+      for (let i = 0; i < ALERT_THRESHOLD; i += 1) {
+        const { sleepMs: _s, ...next } = await runCycle(
+          deps, state, new Date(MULTI_NOW.getTime() + i * 600_000),
+        )
+        state = next
+      }
+
+      const sent = vi.mocked(deps.operatorNotifier.send)
+      expect(sent).toHaveBeenCalledTimes(1) // 소스별 알림과 사이클 알림이 겹쳐 두 번 울리면 안 된다
+      expect(sent.mock.calls[0]?.[0]).toContain('워커 연속 실패')
+      // 구독자 채널과의 분리는 위 I7 테스트가 따로 고정한다 — 여기 depsWith 는
+      // 두 채널이 같은 객체라 그 구분을 검증할 수 없다.
+    })
+
+    it('예산 가드는 예산 있는 소스의 주기에만 걸린다', async () => {
+      const dart = fakePlan('dart', 10_000, true)
+      const news = fakePlan('news', 30_000, false)
+      // 17,000 / 20,000 = 85% — budgetGuard 의 80% 감속선 위라 2배가 된다.
+      const deps = depsWith([dart, news], 17_000)
+
+      const t0 = MULTI_NOW.getTime()
+      const r = await runCycle(deps, initialState([dart, news]), new Date(t0))
+
+      // 예산을 쓰는 소스만 자기 주기가 늘어난다. 사이클 sleep 만 늘리면 더 짧은
+      // 뉴스 주기가 먼저 깨워 DART 가 원래 주기로 다시 떠 가드가 무력화된다.
+      expect(r.nextRunAt.get('dart')).toBe(t0 + 20_000)
+      expect(r.nextRunAt.get('news')).toBe(t0 + 30_000)
     })
   })
 })

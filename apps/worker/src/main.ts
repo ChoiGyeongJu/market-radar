@@ -96,6 +96,8 @@ async function main(): Promise<void> {
       // 사흘치 밀린 것인지 구분할 방법이 없다 (스펙 §6.4).
       coldStart: new Map([[source.id, true]]),
       nextRunAt: new Map(),
+      // 서킷도 소스별이다. 첫 실행 때 소스 id 를 보고 만들어 넣는다.
+      circuits: new Map(),
     },
     sleeper,
     { shouldStop: () => shuttingDown },
