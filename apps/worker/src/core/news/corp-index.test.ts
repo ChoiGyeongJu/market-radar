@@ -4,13 +4,16 @@ import { buildCorpIndex, matchCorp } from './corp-index.js'
 const INDEX = buildCorpIndex([
   { name: '삼성전자', ticker: '005930' },
   { name: '한미약품', ticker: '128940' },
-  { name: '대상', ticker: '001680' },      // 일반 단어
-  { name: '한창', ticker: '005110' },      // 일반 부사
-  { name: '진영', ticker: '285800' },      // 사람 이름
-  { name: 'CJ', ticker: '001040' },        // 2글자 영문
-  { name: 'SK', ticker: '001200' },        // 경계 테스트용
-  { name: 'LG', ticker: '003550' },        // 경계 테스트용
-  { name: 'CJ대한통운', ticker: '000023' }, // 혼합 이름 테스트용
+  { name: '대상', ticker: '001680' },        // 일반 단어
+  { name: '한창', ticker: '005110' },        // 일반 부사
+  { name: '진영', ticker: '285800' },        // 사람 이름
+  { name: 'CJ', ticker: '001040' },          // 2글자 영문
+  { name: 'SK', ticker: '001200' },          // 경계 테스트용
+  { name: 'LG', ticker: '003550' },          // 경계 테스트용
+  { name: 'CJ대한통운', ticker: '000023' },   // 혼합 이름 테스트용
+  { name: 'SK하이닉스', ticker: '000660' },  // 혼합 한글 이름
+  { name: 'LG전자', ticker: '003550' },      // 혼합 한글 이름
+  { name: 'DB하이텍', ticker: '000000' },    // 혼합 한글 이름
 ])
 
 describe('matchCorp', () => {
@@ -62,5 +65,25 @@ describe('matchCorp', () => {
     expect(matchCorp('CJ 주가 급등', INDEX)?.ticker).toBe('001040')
     // CJ 독립 토큰 (문맥 신호 없음) — 모호하면 문맥 필요
     expect(matchCorp('CJ 대한통운 파업', INDEX)).toBeNull()
+  })
+
+  it('라틴 약어는 모든 등장을 스캔한다 — 첫 등장이 경계 밖이어도 나중 등장이 경계 내면 매칭', () => {
+    // 첫 등장: SKT (경계 밖), 나중 등장: SK (경계 내) → SK로 매칭해야 함
+    expect(matchCorp('SKT 요금제 개편, SK 주가 강세', INDEX)?.ticker).toBe('001200')
+    // 첫 등장: LGU+ (경계 밖), 나중 등장: LG (경계 내) → LG로 매칭해야 함
+    expect(matchCorp('LGU+ 요금 인하, LG 주가 급등', INDEX)?.ticker).toBe('003550')
+    // 첫 등장: NSK (경계 밖), 나중 등장: SK (경계 내) → SK로 매칭해야 함
+    expect(matchCorp('NSK 베어링 수입, SK 증시 강세', INDEX)?.ticker).toBe('001200')
+    // 첫 등장: SKY캐슬 (경계 밖), 나중 등장: SK (경계 내) → SK로 매칭해야 함
+    expect(matchCorp('SKY캐슬 방영, SK 주가 급등', INDEX)?.ticker).toBe('001200')
+  })
+
+  it('혼합 한글 이름은 경계 확인 없이 매칭한다', () => {
+    // SK하이닉스는 혼합 이름이므로 경계 확인 안 함
+    expect(matchCorp('SK하이닉스 목표주가 상향', INDEX)?.ticker).toBe('000660')
+    // LG전자도 경계 확인 없이 매칭
+    expect(matchCorp('LG전자 실적 발표', INDEX)?.ticker).toBe('003550')
+    // DB하이텍도 경계 확인 없이 매칭
+    expect(matchCorp('DB하이텍 주가 20만원 목표', INDEX)?.ticker).toBe('000000')
   })
 })

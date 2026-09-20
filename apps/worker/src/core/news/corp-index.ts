@@ -47,19 +47,26 @@ export function buildCorpIndex(entries: readonly CorpEntry[]): CorpIndex {
 export function matchCorp(text: string, index: CorpIndex): CorpEntry | null {
   const hasContext = CONTEXT_SIGNALS.some((s) => text.includes(s))
   for (const e of index.byLength) {
-    const idx = text.indexOf(e.name)
-    if (idx === -1) continue
+    if (!text.includes(e.name)) continue
 
     // 라틴 문자만 포함된 이름은 단어 경계를 확인해야 한다.
     // SK가 SKY에 포함되면 안 되고, 한미약품,나 SK하이닉스처럼
     // 한글 문자와 연결된 것은 경계 없이 매칭된다 (정렬 순서로 해결됨).
+    // 첫 등장이 경계 내 아니어도 다음 등장이 경계 내면 괜찮다.
+    // SKT 요금, SK 주가 → SK는 두 번째 등장에서 매칭해야 한다.
     if (/^[A-Za-z0-9]+$/.test(e.name)) {
-      const before = idx === 0 ? ' ' : text[idx - 1]!
-      const after = idx + e.name.length >= text.length ? ' ' : text[idx + e.name.length]!
-      // 앞뒤 이웃이 라틴 문자나 숫자면 경계 없음 — 계속 찾음
-      if (/[A-Za-z0-9]/.test(before) || /[A-Za-z0-9]/.test(after)) {
-        continue
+      let idx = text.indexOf(e.name)
+      let hasValidBoundary = false
+      while (idx !== -1 && !hasValidBoundary) {
+        const before = idx === 0 ? ' ' : text[idx - 1]!
+        const after = idx + e.name.length >= text.length ? ' ' : text[idx + e.name.length]!
+        // 이 등장이 경계 조건을 만족하면 매칭 가능
+        if (!/[A-Za-z0-9]/.test(before) && !/[A-Za-z0-9]/.test(after)) {
+          hasValidBoundary = true
+        }
+        idx = text.indexOf(e.name, idx + 1)
       }
+      if (!hasValidBoundary) continue
     }
 
     if (AMBIGUOUS_NAMES.has(e.name) && !hasContext) continue
