@@ -74,3 +74,23 @@ export function matchCorp(text: string, index: CorpIndex): CorpEntry | null {
   }
   return null
 }
+
+/**
+ * 뉴스 통용명 → 티커. DART 는 법인 등기명을 주는데 뉴스는 통용명을 쓴다.
+ *
+ * 주요 42개 종목으로 실측해 6개를 찾았다. 알고리즘으로 유도할 수 있는 규칙이
+ * 아니라(현대자동차→현대차는 되지만 한국가스공사→한국가스공사는 그대로다)
+ * 손으로 관리한다. 3a 운영 데이터의 no-corp-match 를 보고 늘린다.
+ *
+ * 한국전력은 누락이 아니라 오귀속을 고친다 — 등록명이 한국전력공사라
+ * 기사의 "한국전력" 이 별개 상장사 "국전" 에 잡히고 있었다. 별칭(4자)이
+ * 국전(2자)보다 길어 긴 이름 우선 규칙이 먼저 잡는다.
+ */
+export const CORP_ALIASES: ReadonlyArray<{ alias: string; ticker: string }> = [
+  { alias: '현대차', ticker: '005380' },
+  { alias: '네이버', ticker: '035420' },
+  { alias: 'KT', ticker: '030200' },
+  { alias: '삼성화재', ticker: '000810' },
+  { alias: '에쓰오일', ticker: '010950' },
+  { alias: '한국전력', ticker: '015760' },
+]
