@@ -116,9 +116,12 @@ export async function runCycle(
   const nextRunAt = new Map(state.nextRunAt)
   const circuits = new Map(state.circuits)
   let sleepMs: number
-  // 수집 전체가 실패해 던졌는가. 바깥 catch 가 알림을 한 번 더 보내지 않도록
-  // 구분한다 — 소스별 알림이 이미 나갔다.
+  // 수집 전체가 실패해 던졌는가. 바깥 catch 는 이 값으로 "수집이 무너진 것"과
+  // "발송·다이제스트가 무너진 것"을 가른다 — 알림·카운터·sleep 이 모두 다르다.
   let allSourcesFailed = false
+  // 이번 사이클에 실패한 소스들 중 가장 나쁜 연속 실패 횟수. 'cycle failed'
+  // 로그의 failures 는 "그 실패를 세고 있는 서킷의 값"이어야 한다.
+  let worstSourceFailures = 0
 
   try {
     // 이번 사이클에 실제로 폴링한 소스 수와 그중 실패한 수. 주기 미달로
@@ -194,6 +197,7 @@ export async function runCycle(
 
         circuit.recordFailure()
         const failures = circuit.consecutiveFailures()
+        worstSourceFailures = Math.max(worstSourceFailures, failures)
 
         // 백오프도 소스별이다. 아픈 소스의 다음 실행만 뒤로 민다 — 사이클 전체
         // sleepMs 를 늘리면 DART 장애가 멀쩡한 뉴스 폴링까지 몇 분씩 멈춰 세우고,
@@ -284,8 +288,13 @@ export async function runCycle(
 
     sleepMs = sleepUntilSoonest(nextRunAt, now)
   } catch (err) {
-    deps.circuit.recordFailure()
-    const failures = deps.circuit.consecutiveFailures()
+    // 수집 루프에서 올라온 실패는 소스별 서킷이 이미 셌다. 여기서 또 세면 이
+    // 카운터가 "수집 바깥의 연속 실패"도 "사이클 실패"도 아닌 잡탕이 되고,
+    // 아래 알림이 말하는 N 이 부풀려진다 — 알림 문구와 카운터의 뜻을 맞춘다.
+    if (!allSourcesFailed) deps.circuit.recordFailure()
+    // 로그의 failures 도 그 실패를 센 서킷의 값이어야 한다. 수집 전면 실패에
+    // 사이클 서킷 값(0)을 실으면 "실패했는데 연속 실패 0"이 찍혀 오해를 부른다.
+    const failures = allSourcesFailed ? worstSourceFailures : deps.circuit.consecutiveFailures()
     deps.log.error({ err, failures }, 'cycle failed')
 
     // 수집 실패는 소스별 알림이 이미 담당했다. 여기서 또 보내면 전면 장애 때
@@ -303,11 +312,20 @@ export async function runCycle(
       }
     }
 
-    // 실패 경로도 같은 규칙이다. 실패한 소스는 이미 자기 배수만큼 nextRunAt 이
-    // 밀려 있고, 수집 바깥(발송·다이제스트)에서 터진 실패라면 소스들의
-    // nextRunAt 은 이번 사이클 몫으로 정상 설정돼 있다. 사이클 단위 배수를
-    // 여기서 다시 얹으면 멀쩡한 소스까지 같이 멈춘다.
-    sleepMs = sleepUntilSoonest(nextRunAt, now)
+    // 무엇이 던졌느냐에 따라 물러서는 주체가 다르다.
+    if (allSourcesFailed) {
+      // 수집이 무너진 것이면 escalation 은 이미 소스별 nextRunAt 에 들어 있다.
+      // 사이클 배수를 또 곱하면 실패한 소스는 두 번 밀리고, 멀쩡한 소스는 남의
+      // 장애 때문에 폴링이 멎는다.
+      sleepMs = sleepUntilSoonest(nextRunAt, now)
+    } else {
+      // 발송·다이제스트가 던진 것이면 사이클 단위 문제(대개 DB)다. 소스별
+      // nextRunAt 은 이 실패를 전혀 담고 있지 않으므로 여기서 물러서지 않으면
+      // 장중 10초마다 이미 힘든 DB 를 그대로 다시 두드린다.
+      // 벽시계가 아니라 인자로 받은 now 를 쓴다 — 주말에 재기동된 워커가 평일
+      // 장중에도 주말 주기로 자는 일을 막는다.
+      sleepMs = pollIntervalMs(now) * deps.circuit.intervalMultiplier()
+    }
   } finally {
     // heartbeat 은 반드시 finally 에 둔다. "프로세스가 살아 루프를 돌고 있는가"에
     // 답하는 신호이고, 그 답은 DART 성공 여부와 무관하기 때문이다.

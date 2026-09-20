@@ -43,6 +43,10 @@ function failingStore(): EventStore {
     incrementApiUsage: async () => {
       throw new Error('db unreachable')
     },
+    // 수집만 실패하는 스토어여야 한다. 이게 없으면 소스가 백오프로 건너뛰어진
+    // 사이클에서 runDispatch 가 `claimPending is not a function` 으로 터져,
+    // "연속 소스 실패"를 검증하려는 테스트가 엉뚱한 실패로 통과한다.
+    claimPending: async () => [],
   } as unknown as EventStore
 }
 
@@ -242,15 +246,16 @@ describe('runCycle — 운영자 알림은 구독자 채널로 가지 않는다'
       summarizer, heartbeat, circuit, log: silentLog(), dailyLimit: 20_000,
     }
 
-    // ALERT_THRESHOLD(5) 회째에 알림이 나간다. 소스별 nextRunAt 이 생겼으므로
-    // 매 사이클 시계를 폴링 주기만큼 밀어야 실제로 5회 폴링한다 — 같은 시각으로
-    // 다섯 번 부르면 2회차부터 주기 미달로 건너뛰어 실패가 쌓이지 않는다.
-    // 운영에서는 실패 후 sleep 이 최소 폴링 주기이므로 이 진행이 실제 동작과 같다.
+    // ALERT_THRESHOLD(5) 회째에 알림이 나간다. 소스마다 nextRunAt 과 백오프가
+    // 생겼으므로 시계를 **스케줄러가 돌려준 sleepMs 만큼** 밀어야 매 사이클 실제로
+    // 폴링한다 — 고정 간격으로 부르면 백오프에 걸린 사이클이 그냥 건너뛰어져
+    // 연속 실패가 5에 닿지 못한다. runLoop 가 운영에서 하는 일과 같은 진행이다.
     let state = warmState()
+    let at = NOW.getTime()
     for (let i = 0; i < ALERT_THRESHOLD; i += 1) {
-      const at = new Date(NOW.getTime() + i * pollIntervalMs(NOW))
-      const { sleepMs: _sleepMs, ...next } = await runCycle(deps, state, at)
+      const { sleepMs, ...next } = await runCycle(deps, state, new Date(at))
       state = next
+      at += sleepMs
     }
 
     expect(operator.send).toHaveBeenCalledTimes(1)
@@ -305,6 +310,11 @@ describe('runCycle — 다중 소스', () => {
       intervalMs: () => intervalMs,
       countsAgainstApiBudget,
     }
+  }
+
+  /** 어느 소스든 항상 실패하게 만든다. */
+  function breakSource(plan: ReturnType<typeof fakePlan>, msg: string) {
+    plan.source.fetchLatest = vi.fn(async () => { throw new Error(msg) })
   }
 
   /**
@@ -429,9 +439,12 @@ describe('runCycle — 다중 소스', () => {
 
       await runCycle(deps, initialState([a, b]), MULTI_NOW)
 
-      expect(deps.circuit.recordFailure).toHaveBeenCalledTimes(1)
+      // 수집 실패는 소스별 서킷이 센다. 사이클 서킷은 수집 **바깥**의 실패
+      // 전용이므로 여기서는 올라가지 않는다 — 올라가면 알림의 N 이 부풀려진다.
+      expect(deps.circuit.recordFailure).not.toHaveBeenCalled()
       expect(deps.circuit.recordSuccess).not.toHaveBeenCalled()
       expect(deps.store.claimPending).not.toHaveBeenCalled()
+      // 실패 경로를 실제로 탔다는 증거는 이 로그다.
       expect(deps.log.error).toHaveBeenCalledWith(
         expect.objectContaining({ failures: 1 }),
         'cycle failed',
@@ -445,9 +458,13 @@ describe('runCycle — 다중 소스', () => {
 
       await runCycle(deps, initialState([only]), MULTI_NOW)
 
-      expect(deps.circuit.recordFailure).toHaveBeenCalledTimes(1)
+      expect(deps.circuit.recordFailure).not.toHaveBeenCalled() // 소스별 서킷이 센다
       expect(deps.circuit.recordSuccess).not.toHaveBeenCalled()
       expect(deps.store.claimPending).not.toHaveBeenCalled()
+      expect(deps.log.error).toHaveBeenCalledWith(
+        expect.objectContaining({ failures: 1 }),
+        'cycle failed',
+      )
     })
 
     it('주기 미달로 아무 소스도 안 본 사이클은 실패가 아니다', async () => {
@@ -473,11 +490,6 @@ describe('runCycle — 다중 소스', () => {
    * 최대 연속실패 1, 운영자 알림 0건이었다.
    */
   describe('서킷과 백오프는 소스마다 따로다', () => {
-    /** 어느 소스든 항상 실패하게 만든다. */
-    function breakSource(plan: ReturnType<typeof fakePlan>, msg: string) {
-      plan.source.fetchLatest = vi.fn(async () => { throw new Error(msg) })
-    }
-
     it('건강한 소스가 있어도 죽은 소스의 연속 실패는 쌓여 알림이 나간다 — 소스 이름을 붙여서', async () => {
       const dart = fakePlan('dart', 10_000)
       breakSource(dart, 'DART down')
@@ -635,6 +647,94 @@ describe('runCycle — 다중 소스', () => {
       // 뉴스 주기가 먼저 깨워 DART 가 원래 주기로 다시 떠 가드가 무력화된다.
       expect(r.nextRunAt.get('dart')).toBe(t0 + 20_000)
       expect(r.nextRunAt.get('news')).toBe(t0 + 30_000)
+    })
+  })
+
+  /**
+   * 발송·다이제스트가 던진 실패는 소스별 nextRunAt 이 담지 못한다. 여기서
+   * 물러서지 않으면 이미 힘든 DB 를 장중 10초마다 그대로 다시 두드린다.
+   */
+  describe('수집 바깥의 실패는 사이클 단위로 물러선다', () => {
+    function depsWithBrokenDispatch(plans: readonly SourcePlan[]): CycleDeps {
+      const store = {
+        incrementApiUsage: vi.fn(async () => 1),
+        claimPending: vi.fn(async (): Promise<never[]> => { throw new Error('db unreachable') }),
+      } as unknown as EventStore
+      return { ...depsWith(plans), store }
+    }
+
+    it('발송이 계속 실패하면 사이클 주기가 서킷 사다리대로 늘어난다', async () => {
+      const dart = fakePlan('dart', 10_000)
+      const news = fakePlan('news', 30_000)
+      const deps = depsWithBrokenDispatch([dart, news])
+
+      let state = initialState([dart, news])
+      let t = MULTI_NOW.getTime()
+      const base = pollIntervalMs(MULTI_NOW) // 월요일 장중 = 10초
+      for (const multiplier of [2, 4, 8, 16]) {
+        const { sleepMs, ...next } = await runCycle(deps, state, new Date(t))
+        expect(sleepMs).toBe(base * multiplier)
+        state = next
+        t += sleepMs
+      }
+      // 소스는 멀쩡했다 — 물러선 주체는 사이클이다.
+      expect(deps.circuit.recordFailure).toHaveBeenCalledTimes(4)
+      expect(state.circuits.get('dart')?.consecutiveFailures()).toBe(0)
+    })
+
+    it('수집이 전면 실패한 사이클은 사이클 배수를 다시 얹지 않는다', async () => {
+      const dart = fakePlan('dart', 10_000)
+      breakSource(dart, 'DART down')
+      const news = fakePlan('news', 30_000)
+      breakSource(news, 'RSS down')
+      const deps = depsWith([dart, news])
+
+      const t0 = MULTI_NOW.getTime()
+      const first = await runCycle(deps, initialState([dart, news]), new Date(t0))
+      // dart 10초×2 = 20초, news 30초×2 = 60초 → 가장 이른 것은 20초.
+      // 사이클 배수가 또 곱해지면 이 값이 아니다.
+      expect(first.sleepMs).toBe(20_000)
+
+      const { sleepMs: _s, ...state } = first
+      const second = await runCycle(deps, state, new Date(t0 + 20_000))
+      // 이번엔 dart 만 주기가 됐고 또 실패 → 10초×4 = 40초. news 는 60초 그대로.
+      expect(second.sleepMs).toBe(40_000)
+    })
+
+    it('수집 전면 실패는 사이클 서킷의 카운터를 올리지 않는다', async () => {
+      const only = fakePlan('dart', 10_000)
+      breakSource(only, 'DART down')
+      const deps = depsWith([only])
+
+      const state = await runCycle(deps, initialState([only]), MULTI_NOW)
+
+      expect(deps.circuit.recordFailure).not.toHaveBeenCalled()
+      // 대신 그 소스의 서킷이 셌다.
+      expect(state.circuits.get('dart')?.consecutiveFailures()).toBe(1)
+    })
+
+    it('소스가 하나일 때 발송 실패의 백오프는 dc68774 이전과 같다', async () => {
+      const source = {
+        id: 'dart',
+        fetchLatest: vi.fn(async (): Promise<NormalizedEvent[]> => []),
+      }
+      const only: SourcePlan = {
+        source,
+        evaluate: (): Verdict => ({ action: 'drop', reason: 'test' }),
+        intervalMs: pollIntervalMs,
+        countsAgainstApiBudget: true,
+      }
+      const deps = depsWithBrokenDispatch([only])
+      const base = pollIntervalMs(MULTI_NOW)
+
+      let state = initialState([only])
+      let t = MULTI_NOW.getTime()
+      for (const multiplier of [2, 4, 8, 16, 32, 32]) {
+        const { sleepMs, ...next } = await runCycle(deps, state, new Date(t))
+        expect(sleepMs).toBe(base * multiplier)
+        state = next
+        t += sleepMs
+      }
     })
   })
 })
