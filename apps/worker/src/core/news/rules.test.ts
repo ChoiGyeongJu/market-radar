@@ -87,4 +87,62 @@ describe('evaluateNews', () => {
     if (v.action !== 'pass') throw new Error('pass여야 한다')
     expect(v.rule).toMatch(/^keyword:/)
   })
+
+  // 화재 키워드 특이화 테스트 — 회사명 일부나 squash 부산물로 잘못 매칭되는 것을 방지한다.
+  describe('화재 키워드 특이화', () => {
+    const FIRE_INDEX = buildCorpIndex([
+      { name: '흥국화재', ticker: '000030' },
+      { name: '삼성화재해상보험', ticker: '000810' },
+      { name: '한미약품', ticker: '128940' },
+    ])
+
+    it('회사명에 화재가 포함된 경우 — 흥국화재, 3분기 실적 발표', () => {
+      // 과거: keyword:화재로 오탐
+      // 지금: 다른 신호(실적발표)로 통과하거나 drop
+      const v = evaluateNews(ev('흥국화재, 3분기 실적 발표'), FIRE_INDEX, '')
+      if (v.action === 'pass') {
+        expect(v.rule).toBe('keyword:실적발표')
+      } else {
+        expect(v).toEqual({ action: 'drop', reason: 'no-keyword-match' })
+      }
+    })
+
+    it('회사명에 화재가 포함되고 다른 신호도 없는 경우 — 흥국화재 신임 대표 선임', () => {
+      // 과거: keyword:화재로 오탐
+      // 지금: drop
+      expect(evaluateNews(ev('흥국화재 신임 대표 선임'), FIRE_INDEX, '')).toEqual({
+        action: 'drop', reason: 'no-keyword-match',
+      })
+    })
+
+    it('회사명에 화재가 포함된 긴 회사명 — 삼성화재해상보험 사옥 이전', () => {
+      // 과거: keyword:화재로 오탐
+      // 지금: drop
+      expect(evaluateNews(ev('삼성화재해상보험 사옥 이전'), FIRE_INDEX, '')).toEqual({
+        action: 'drop', reason: 'no-keyword-match',
+      })
+    })
+
+    it('squash 부산물로 잘못된 화재 매칭 — 대형화 + 재무구조 = 화재', () => {
+      // "사업 대형화 재무구조 개선" → "사업대형화재무구조개선" 에 화재 포함
+      // 과거: keyword:화재로 오탐
+      // 지금: drop
+      expect(evaluateNews(ev('한미약품, 사업 대형화 재무구조 개선 계획 발표'), FIRE_INDEX, '')).toEqual({
+        action: 'drop', reason: 'no-keyword-match',
+      })
+    })
+
+    it('실제 공장 화재는 공장화재로 매칭된다', () => {
+      // 실제 화재 뉴스: 공장화재 키워드가 정상 작동
+      const v = evaluateNews(ev('삼성전자 공장 화재로 생산 중단'), INDEX, '')
+      expect(v).toMatchObject({ action: 'pass', tier: 'high', rule: 'keyword:공장화재' })
+    })
+
+    it('화재사고 키워드로도 매칭된다', () => {
+      // 공장 화재사고는 공장화재를 먼저 만나므로 keyword:공장화재로 매칭되지만,
+      // 순수 화재사고 상황도 테스트한다
+      const v = evaluateNews(ev('한미약품 화재사고 발생'), INDEX, '')
+      expect(v).toMatchObject({ action: 'pass', tier: 'high', rule: 'keyword:화재사고' })
+    })
+  })
 })
