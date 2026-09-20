@@ -40,6 +40,15 @@ const envSchema = z.object({
       .positive(DART_DAILY_LIMIT_MSG)
       .default(20_000),
   ),
+  // 배포와 활성화를 분리한다. 이미지가 올라간 뒤에도 켜기 전까지 기존 동작
+  // 그대로이므로, 뉴스가 채널을 뒤덮으면 이미지를 되돌리지 않고 끌 수 있다.
+  NEWS_ENABLED: optionalField(z.enum(['true', 'false']).default('false')),
+  // 60초. RSS 반영 지연이 중앙값 3.5분(210초)이라 폴링 주기는 반올림 오차에 가깝고,
+  // 조건부 요청이 실측상 5개 중 1개에서만 먹는다(스펙 §4.3) — 나머지는 매번 전문을
+  // 다시 받는다. 30초면 하루 1.2GB, 60초면 0.6GB이고 지연은 6.7%만 나빠진다.
+  NEWS_INTERVAL_MS: optionalField(
+    z.coerce.number().int().positive().default(60_000),
+  ),
 })
 
 export type Config = {
@@ -57,6 +66,10 @@ export type Config = {
   heartbeatUrl: string | null
   /** 계정에 발급된 일일 호출 한도. 미설정 시 OpenDART 문서상 기본값(20,000). */
   dartDailyLimit: number
+  /** 기본 false — 배포와 활성화를 분리한다. 켜기 전까지 기존 동작(DART 단일 소스) 그대로다. */
+  newsEnabled: boolean
+  /** RSS 폴링 주기(ms). 기본 60초. */
+  newsIntervalMs: number
 }
 
 export function loadConfig(env: Record<string, string | undefined>): Config {
@@ -69,5 +82,7 @@ export function loadConfig(env: Record<string, string | undefined>): Config {
     llm: { apiKey: parsed.LLM_API_KEY, model: parsed.LLM_MODEL, endpoint: parsed.LLM_ENDPOINT },
     heartbeatUrl: parsed.HEARTBEAT_URL ?? null,
     dartDailyLimit: parsed.DART_DAILY_LIMIT,
+    newsEnabled: parsed.NEWS_ENABLED === 'true',
+    newsIntervalMs: parsed.NEWS_INTERVAL_MS,
   }
 }

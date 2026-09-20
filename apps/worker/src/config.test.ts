@@ -210,6 +210,24 @@ describe('loadConfig — 빈 값·공백은 "키 없음"과 동일하게 취급�
 // 전처리는 선택/기본값 필드에만 적용된다. 필수 필드는 여전히 엄격해야 한다 —
 // 빈 문자열이 "없음"으로 접혀 통과해 버리면 필수값 누락을 조용히 숨기게 된다.
 // --------------------------------------------------------------------------
+describe('loadConfig — NEWS_ENABLED / NEWS_INTERVAL_MS (배포와 활성화를 분리한다)', () => {
+  it('NEWS_ENABLED 기본값은 false — 배포와 활성화를 분리한다', () => {
+    expect(loadConfig(valid).newsEnabled).toBe(false)
+  })
+
+  it('NEWS_ENABLED=true면 켜진다', () => {
+    expect(loadConfig({ ...valid, NEWS_ENABLED: 'true' }).newsEnabled).toBe(true)
+  })
+
+  it('NEWS_INTERVAL_MS 기본값은 60초 — 조건부 요청이 거의 안 먹어 매번 전문을 받는다', () => {
+    expect(loadConfig(valid).newsIntervalMs).toBe(60_000)
+  })
+
+  it('빈 문자열은 기본값으로 접힌다', () => {
+    expect(loadConfig({ ...valid, NEWS_INTERVAL_MS: '' }).newsIntervalMs).toBe(60_000)
+  })
+})
+
 describe('loadConfig — 필수 값은 빈 문자열이어도 여전히 거부한다 (전처리로 약화되지 않는다)', () => {
   it('DATABASE_URL 빈 문자열은 거부한다', () => {
     expect(() => loadConfig({ ...valid, DATABASE_URL: '' })).toThrow(/DATABASE_URL/)

@@ -4,15 +4,20 @@ import pino from 'pino'
 import { kstDateString } from './core/budget.js'
 import { createCircuit } from './core/circuit.js'
 import { evaluateDart } from './core/dart/rules.js'
+import { evaluateNews } from './core/news/rules.js'
+import { buildCorpIndex } from './core/news/corp-index.js'
 import { pollIntervalMs } from './core/schedule.js'
-import { createSeenSet, SEEN_CAPACITY } from './core/seen.js'
+import { createSeenSet, SEEN_CAPACITY, type SeenSet } from './core/seen.js'
 import { loadConfig } from './config.js'
 import { createDartSource } from './adapters/sources/dart.js'
+import { createRssSource, FEEDS } from './adapters/sources/rss.js'
+import { fetchCorpEntries } from './adapters/sources/corp-code.js'
 import { createPostgresStore, type Db } from './adapters/store/postgres.js'
 import { createTelegramNotifier } from './adapters/notifier/telegram.js'
 import { noopSummarizer } from './adapters/summarizer/noop.js'
 import { createHeartbeat } from './pipeline/health.js'
 import { runLoop, createSleeper } from './pipeline/cycle.js'
+import type { SourcePlan } from './pipeline/ingest.js'
 
 const log = pino({ level: process.env.LOG_LEVEL ?? 'info' })
 
@@ -22,14 +27,37 @@ async function main(): Promise<void> {
   const sql = postgres(cfg.databaseUrl)
   const db = drizzle(sql) as unknown as Db
   const store = createPostgresStore(db)
-  const source = createDartSource({ apiKey: cfg.dartApiKey })
-  // 소스 하나뿐이지만 runCycle 은 이제 SourcePlan 목록을 받는다. 주기·예산·판정은
-  // 기존 공시 동작 그대로다 (뉴스 소스는 다음 태스크에서 붙인다).
-  const dartPlan = {
-    source,
+  // 공시 소스는 NEWS_ENABLED 와 무관하게 항상 켜져 있다. 주기·예산·판정은
+  // 기존 동작 그대로다.
+  const plans: SourcePlan[] = [{
+    source: createDartSource({ apiKey: cfg.dartApiKey }),
     evaluate: evaluateDart,
     intervalMs: pollIntervalMs,
     countsAgainstApiBudget: true,
+  }]
+
+  if (cfg.newsEnabled) {
+    // 명부를 못 받으면 기동을 중단한다 — throw 를 여기서 삼키지 않는다. 빈 명부로
+    // 돌면 모든 뉴스가 no-corp-match 로 drop 되면서 워커는 정상으로 보이고
+    // 알림만 0건이 된다 (fetchCorpEntries 주석 참고).
+    const corpIndex = buildCorpIndex(await fetchCorpEntries(cfg.dartApiKey))
+    const rss = createRssSource({
+      feeds: FEEDS,
+      // 콜백을 넘기지 않으면 죽은 피드가 흔적 없이 사라진다.
+      onFeedError: (feedId, err) => log.error({ err, feedId }, 'rss feed failed'),
+    })
+    log.info({ corps: corpIndex.byLength.length, feeds: FEEDS.length }, 'news source enabled')
+    plans.push({
+      source: rss,
+      // description 은 판정에만 쓰고 이벤트에 담지 않으므로 여기서 꺼내 넘긴다.
+      // rss.descriptionOf 는 fetchLatest 가 매 호출마다 통째로 교체하는 맵을
+      // 읽으므로, 반드시 같은 사이클 안에서(이 이벤트를 만든 fetchLatest 직후)
+      // 평가해야 한다 — 이벤트를 사이클 밖으로 들고 나가 나중에 평가하면
+      // description 이 이미 다음 fetch 로 교체되어 빈 문자열을 읽는다.
+      evaluate: (e) => evaluateNews(e, corpIndex, rss.descriptionOf(e.externalId)),
+      intervalMs: () => cfg.newsIntervalMs,
+      countsAgainstApiBudget: false,
+    })
   }
   const notifier = createTelegramNotifier(cfg.telegram)
   // 운영자 채널이 설정되면 다이제스트와 장애 알림만 그쪽으로 뺀다. 토큰 버킷은
@@ -65,10 +93,21 @@ async function main(): Promise<void> {
       sleeper.wakeNow()
     })
   }
-  // 이미 본 공시 집합을 DB에서 심는다. 이게 없으면 첫 사이클이 최신 100건을 전부
-  // recordEvent 로 보내고, 그 뒤로도 매 사이클 같은 100건이 no-op 트랜잭션으로
-  // 반복된다 — 사이클이 DB 왕복 속도에 묶인다.
-  const seen = createSeenSet(await store.recentExternalIds(source.id, SEEN_CAPACITY))
+  // 이미 본 이벤트 집합을 DB에서 소스별로 심는다. 이게 없으면 첫 사이클이 최신
+  // 100건을 전부 recordEvent 로 보내고, 그 뒤로도 매 사이클 같은 100건이 no-op
+  // 트랜잭션으로 반복된다 — 사이클이 DB 왕복 속도에 묶인다.
+  // seen·coldStart 는 소스별이다 — externalId 는 소스 안에서만 유일하다. 공시
+  // 접수번호와 뉴스 guid 가 우연히 겹치면 한 집합에서는 한쪽이 다른 쪽에 가려
+  // 안 보인다.
+  const seen = new Map<string, SeenSet>()
+  for (const p of plans) {
+    seen.set(p.source.id, createSeenSet(await store.recentExternalIds(p.source.id, SEEN_CAPACITY)))
+  }
+  // 첫 사이클은 기록만 하고 한 건도 발송하지 않는다. 워커는 자신이 얼마나 오래
+  // 죽어 있었는지 알 수 없으므로, 처음 보는 물량이 신규 1건인지 사흘치 밀린
+  // 것인지 구분할 방법이 없다 (스펙 §6.4). 새로 붙인 소스도 첫 사이클은 동일하다.
+  const coldStart = new Map(plans.map((p) => [p.source.id, true]))
+  const nextRunAt = new Map(plans.map((p) => [p.source.id, 0]))
 
   // lastDigestDate 를 메모리에서만 초기화하면 KST 자정을 넘긴 재기동이 그 값을
   // 오늘로 되돌려 전날 다이제스트가 영영 발송되지 않는다 — 따라잡기 루프가
@@ -76,26 +115,27 @@ async function main(): Promise<void> {
   const lastDigestDate = (await store.lastEventKstDate()) ?? kstDateString(new Date())
 
   log.info(
-    { seen: seen.size, lastDigestDate, operatorChannel: cfg.operatorChatId !== null },
+    {
+      seen: [...seen.values()].reduce((n, s) => n + s.size, 0),
+      lastDigestDate,
+      operatorChannel: cfg.operatorChatId !== null,
+      newsEnabled: cfg.newsEnabled,
+    },
     'worker started',
   )
 
   await runLoop(
     {
-      plans: [dartPlan], store, notifier, operatorNotifier, summarizer, heartbeat, circuit, log,
+      plans, store, notifier, operatorNotifier, summarizer, heartbeat, circuit, log,
       dailyLimit: cfg.dartDailyLimit,
     },
     {
       lastDigestDate,
       digestAttempt: null,
       heartbeatFailures: 0,
-      // seen·coldStart 는 소스별이다 — externalId 는 소스 안에서만 유일하다.
-      seen: new Map([[source.id, seen]]),
-      // 첫 사이클은 기록만 하고 한 건도 발송하지 않는다. 워커는 자신이 얼마나
-      // 오래 죽어 있었는지 알 수 없으므로, 처음 보는 물량이 신규 1건인지
-      // 사흘치 밀린 것인지 구분할 방법이 없다 (스펙 §6.4).
-      coldStart: new Map([[source.id, true]]),
-      nextRunAt: new Map(),
+      seen,
+      coldStart,
+      nextRunAt,
       // 서킷도 소스별이다. 첫 실행 때 소스 id 를 보고 만들어 넣는다.
       circuits: new Map(),
     },

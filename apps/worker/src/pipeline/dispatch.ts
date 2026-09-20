@@ -1,10 +1,16 @@
-import { formatEvent, formatMerged } from '../core/format.js'
+import { formatEvent, formatMerged, formatNewsEvent, formatNewsMerged } from '../core/format.js'
 import { MAX_MERGED_CHARS, MERGE_THRESHOLD } from '../core/policy.js'
 import { MAX_ATTEMPTS, nextAttemptAt } from '../core/retry.js'
 import { LOCAL_RATE_LIMIT } from '../ports/notifier.js'
 import type { Notifier } from '../ports/notifier.js'
 import type { EventStore, PendingOutbox } from '../ports/store.js'
 import type { Summarizer } from '../ports/summarizer.js'
+
+// 소스별로 포맷을 가른다. 뉴스는 subject 가 없어 공시 포맷(subjectLine)을 그대로
+// 쓰면 안 되고, 병합 헤더도 "공시 N건"/"뉴스 N건" 이 서로를 대신할 수 없다.
+const isNews = (i: PendingOutbox): boolean => i.event.sourceId === 'news'
+const one = (i: PendingOutbox, summary?: string): string =>
+  isNews(i) ? formatNewsEvent(i.event, i.tier) : formatEvent(i.event, i.tier, summary)
 
 export type DispatchDeps = {
   store: EventStore
@@ -37,30 +43,42 @@ export async function runDispatch(deps: DispatchDeps, now: Date): Promise<Dispat
 
   // critical — 속도가 목적이므로 병합하지 않는다
   for (const item of criticals) {
-    await sendOne(deps, item, formatEvent(item.event, item.tier), now, stats)
+    await sendOne(deps, item, one(item), now, stats)
   }
 
   // 그 외 — 임계 이상이면 한 메시지로 묶어 rate limit 압박을 줄인다.
   // 병합 메시지는 요약을 붙이지 않는다 — 개별 발송과 달리 알림에 요약이 있는지 여부가
   // "마침 그때 몇 건이 밀려 있었는가"로 결정되는 것은 의도된 지연·길이 트레이드오프다.
-  if (others.length >= MERGE_THRESHOLD) {
-    // MAX_MERGED_CHARS를 넘기 전까지만 배치에 담는다 — 텔레그램 4096자 한도를 넘기면
-    // 배치 전체가 거부되어 안의 항목이 모두 같이 죽는다. 담기지 못한 항목은 아무 store
-    // 호출도 받지 않고 pending으로 남아 다음 사이클에 다시 claim된다 — 유실되지 않는다.
-    const batch: PendingOutbox[] = []
-    for (const item of others) {
-      const next = [...batch, item]
-      if (formatMerged(next.map((i) => ({ event: i.event, tier: i.tier }))).length > MAX_MERGED_CHARS) break
-      batch.push(item)
-    }
-    const text = formatMerged(batch.map((i) => ({ event: i.event, tier: i.tier })))
-    const res = await deps.notifier.send(text)
-    for (const item of batch) await applyResult(deps, item, res, now, stats)
-  } else {
-    for (const item of others) {
-      const summary = await deps.summarizer.summarize(item.event)
-      const text = formatEvent(item.event, item.tier, summary ?? undefined)
-      await sendOne(deps, item, text, now, stats)
+  //
+  // 뉴스와 공시는 따로 묶는다 — 한 메시지에 섞으면 병합 헤더("공시 N건"/"뉴스 N건")가
+  // 둘 중 하나로 거짓말을 하게 되고, formatMerged 는 뉴스에 없는 subject 필드를 읽는다.
+  const newsOthers = others.filter(isNews)
+  const dartOthers = others.filter((i) => !isNews(i))
+  for (const [group, fmt] of [
+    [dartOthers, formatMerged] as const,
+    [newsOthers, formatNewsMerged] as const,
+  ]) {
+    if (group.length === 0) continue
+    if (group.length >= MERGE_THRESHOLD) {
+      // MAX_MERGED_CHARS를 넘기 전까지만 배치에 담는다 — 텔레그램 4096자 한도를 넘기면
+      // 배치 전체가 거부되어 안의 항목이 모두 같이 죽는다. 담기지 못한 항목은 아무 store
+      // 호출도 받지 않고 pending으로 남아 다음 사이클에 다시 claim된다 — 유실되지 않는다.
+      const batch: PendingOutbox[] = []
+      for (const item of group) {
+        const next = [...batch, item]
+        if (fmt(next.map((i) => ({ event: i.event, tier: i.tier }))).length > MAX_MERGED_CHARS) break
+        batch.push(item)
+      }
+      const text = fmt(batch.map((i) => ({ event: i.event, tier: i.tier })))
+      const res = await deps.notifier.send(text)
+      for (const item of batch) await applyResult(deps, item, res, now, stats)
+    } else {
+      for (const item of group) {
+        // 뉴스는 요약기를 태우지 않는다 — description 을 넘길 수 없어 입력이 제목뿐이고,
+        // 그 제목은 같은 메시지 두 줄 위에 이미 찍혀 나간다 (main.ts 의 noopSummarizer 주석과 같은 이유).
+        const summary = isNews(item) ? undefined : (await deps.summarizer.summarize(item.event)) ?? undefined
+        await sendOne(deps, item, one(item, summary), now, stats)
+      }
     }
   }
 
