@@ -580,6 +580,23 @@ description 은 판정에만 쓰고 반환하지 않는다 — 저작권상 저�
 
 **Why:** Task 2 의 인덱스에 넣을 실제 상장사 목록이 필요하다. DART `corpCode.xml` 이 전체 기업 고유번호를 주며 `stock_code` 가 있는 항목이 상장사다. 응답이 ZIP 이라 해제가 필요하다.
 
+**등록명만으로는 부족하다 — 별칭이 필요하다.** DART 는 법인 등기명을 주는데 뉴스는 통용명을 쓴다. 주요 42개 종목으로 실측한 결과 6개가 매칭되지 않았다:
+
+| 뉴스 표기 | DART 등록명 | 지금 결과 |
+|---|---|---|
+| 현대차 | 현대자동차 | 매칭 없음 |
+| 네이버 | NAVER | 매칭 없음 |
+| KT | 케이티 | 매칭 없음 |
+| 삼성화재 | 삼성화재해상보험 | 매칭 없음 |
+| 에쓰오일 | S-Oil | 매칭 없음 |
+| **한국전력** | 한국전력공사 | **`국전` 으로 오귀속** |
+
+마지막 줄이 가장 나쁘다. `한국전력` 이 `국전`(별개 상장사)을 포함해, 한국전력 기사가 무관한 소형주 알림으로 나간다. Task 3 에서 고친 한섬→현대백화점 오귀속과 같은 부류인데 회사가 아예 무관하다는 점이 더 나쁘다.
+
+별칭을 넣으면 두 문제가 같이 풀린다 — `한국전력`(4자)이 `국전`(2자)보다 길어 긴 이름 우선 규칙이 먼저 잡는다.
+
+목록은 짧다. 주요 42개 중 6개였으므로 알고리즘이 아니라 **손으로 관리하는 목록**으로 간다. 3a 운영 데이터의 `no-corp-match` 를 보고 늘린다.
+
 - [ ] **Step 1: 의존성을 추가한다**
 
 ```bash
@@ -641,11 +658,37 @@ describe('fetchCorpEntries', () => {
 Run: `cd apps/worker && npx vitest run src/adapters/sources/corp-code.test.ts`
 Expected: FAIL — `Cannot find module './corp-code.js'`
 
-- [ ] **Step 4: 구현을 쓴다**
+- [ ] **Step 4: `core/news/corp-index.ts` 에 별칭 목록을 추가한다**
+
+순수 데이터이므로 `core/` 에 둔다. 적용은 어댑터가 한다.
+
+```ts
+/**
+ * 뉴스 통용명 → 티커. DART 는 법인 등기명을 주는데 뉴스는 통용명을 쓴다.
+ *
+ * 주요 42개 종목으로 실측해 6개를 찾았다. 알고리즘으로 유도할 수 있는 규칙이
+ * 아니라(현대자동차→현대차는 되지만 한국가스공사→한국가스공사는 그대로다)
+ * 손으로 관리한다. 3a 운영 데이터의 no-corp-match 를 보고 늘린다.
+ *
+ * 한국전력은 누락이 아니라 오귀속을 고친다 — 등록명이 한국전력공사라
+ * 기사의 "한국전력" 이 별개 상장사 "국전" 에 잡히고 있었다. 별칭(4자)이
+ * 국전(2자)보다 길어 긴 이름 우선 규칙이 먼저 잡는다.
+ */
+export const CORP_ALIASES: ReadonlyArray<{ alias: string; ticker: string }> = [
+  { alias: '현대차', ticker: '005380' },
+  { alias: '네이버', ticker: '035420' },
+  { alias: 'KT', ticker: '030200' },
+  { alias: '삼성화재', ticker: '000810' },
+  { alias: '에쓰오일', ticker: '010950' },
+  { alias: '한국전력', ticker: '015760' },
+]
+```
+
+- [ ] **Step 5: 구현을 쓴다**
 
 ```ts
 import { unzipSync, strFromU8 } from 'fflate'
-import type { CorpEntry } from '../../core/news/corp-index.js'
+import { CORP_ALIASES, type CorpEntry } from '../../core/news/corp-index.js'
 
 const ENDPOINT = 'https://opendart.fss.or.kr/api/corpCode.xml'
 
@@ -691,8 +734,45 @@ export async function fetchCorpEntries(
   }
 
   if (out.length === 0) throw new Error('corpCode 응답에 상장사가 한 곳도 없다')
+
+  // 별칭을 붙인다. 티커가 명부에 실제로 있는 것만 — 상장폐지된 티커의 별칭을
+  // 남겨두면 그 이름이 영원히 잘못된 회사로 잡힌다.
+  const tickers = new Set(out.map((e) => e.ticker))
+  for (const a of CORP_ALIASES) {
+    if (tickers.has(a.ticker)) out.push({ name: a.alias, ticker: a.ticker })
+  }
+
   return out
 }
+```
+
+- [ ] **Step 6: 별칭 테스트를 추가한다**
+
+```ts
+it('별칭을 명부에 더한다', async () => {
+  const xml = `<result>
+    <list><corp_code>1</corp_code><corp_name>현대자동차</corp_name>
+          <stock_code>005380</stock_code><modify_date>1</modify_date></list>
+  </result>`
+  const z = zipSync({ 'CORPCODE.xml': strToU8(xml) })
+  const buf = z.buffer.slice(z.byteOffset, z.byteOffset + z.byteLength) as ArrayBuffer
+  const f = (async () => new Response(buf, { status: 200 })) as unknown as typeof fetch
+  const entries = await fetchCorpEntries('k'.repeat(40), f)
+  expect(entries).toContainEqual({ name: '현대자동차', ticker: '005380' })
+  expect(entries).toContainEqual({ name: '현대차', ticker: '005380' })
+})
+
+it('명부에 없는 티커의 별칭은 넣지 않는다 — 상장폐지 종목이 영원히 잘못 잡힌다', async () => {
+  const xml = `<result>
+    <list><corp_code>1</corp_code><corp_name>삼성전자</corp_name>
+          <stock_code>005930</stock_code><modify_date>1</modify_date></list>
+  </result>`
+  const z = zipSync({ 'CORPCODE.xml': strToU8(xml) })
+  const buf = z.buffer.slice(z.byteOffset, z.byteOffset + z.byteLength) as ArrayBuffer
+  const f = (async () => new Response(buf, { status: 200 })) as unknown as typeof fetch
+  const entries = await fetchCorpEntries('k'.repeat(40), f)
+  expect(entries.map((e) => e.name)).not.toContain('현대차')
+})
 ```
 
 - [ ] **Step 5: 테스트가 통과하는지 확인한다**
