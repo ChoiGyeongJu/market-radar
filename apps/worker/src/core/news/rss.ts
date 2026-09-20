@@ -34,12 +34,25 @@ const NAMED: Record<string, string> = {
  * 그걸 또 `<` 로 풀어버린다. 하나의 정규식/alternation 으로 한 번만 스캔하면
  * replace 가 만든 치환 결과를 다시 스캔하지 않으므로 이 문제가 없다.
  */
+/**
+ * 숫자 문자 참조를 실제 문자로 바꾼다. 유효 범위(0 ~ U+10FFFF)를 벗어나면
+ * 원문(`literal`)을 그대로 돌려준다 — `String.fromCodePoint` 는 범위를 벗어나면
+ * RangeError 를 던지는데, 이 함수는 parseRssFeed 의 <item> 루프 안에서 호출되므로
+ * 여기서 던지면 그 사이클에서 이미 파싱한 항목들까지 통째로 날아간다. 하나의
+ * 망가진 제목이 피드 전체를 죽이면 안 된다는 계약은 인식 못 하는 named entity를
+ * 원문 그대로 돌려주는 `?? m` 폴백과 동일한 원칙이다.
+ */
+function toChar(codePoint: number, literal: string): string {
+  if (!Number.isInteger(codePoint) || codePoint < 0 || codePoint > 0x10ffff) return literal
+  return String.fromCodePoint(codePoint)
+}
+
 export function decodeEntities(s: string): string {
   return s.replace(
     /&#x([0-9a-f]+);|&#(\d+);|&([a-z]+);/gi,
     (m, hex: string | undefined, dec: string | undefined, name: string | undefined) => {
-      if (hex !== undefined) return String.fromCodePoint(parseInt(hex, 16))
-      if (dec !== undefined) return String.fromCodePoint(Number(dec))
+      if (hex !== undefined) return toChar(parseInt(hex, 16), m)
+      if (dec !== undefined) return toChar(Number(dec), m)
       return NAMED[name!.toLowerCase()] ?? m
     },
   )

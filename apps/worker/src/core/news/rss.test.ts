@@ -53,6 +53,34 @@ describe('parseRssFeed', () => {
     const noLink = `<rss><channel><item><title>제목</title></item></channel></rss>`
     expect(parseRssFeed(noLink)).toEqual([])
   })
+
+  it('범위를 벗어난 숫자 문자 참조가 title에 있어도 던지지 않고 item을 돌려준다', () => {
+    const make = (title: string) =>
+      `<rss><channel><item><title>${title}</title><link>https://x/1</link></item></channel></rss>`
+
+    expect(() => parseRssFeed(make('&#1114112;'))).not.toThrow()
+    expect(parseRssFeed(make('&#1114112;'))[0]!.title).toBe('&#1114112;')
+
+    expect(() => parseRssFeed(make('&#99999999999999;'))).not.toThrow()
+    expect(parseRssFeed(make('&#99999999999999;'))[0]!.title).toBe('&#99999999999999;')
+
+    expect(() => parseRssFeed(make('&#x110000;'))).not.toThrow()
+    expect(parseRssFeed(make('&#x110000;'))[0]!.title).toBe('&#x110000;')
+  })
+
+  it('한 item의 숫자 참조가 범위를 벗어나도 같은 호출의 다른 item들을 잃지 않는다', () => {
+    // 예외가 <item> 루프 안에서 던져지면 그 사이클에서 이미 파싱된 item들까지
+    // 통째로 날아간다 — 망가진 기사 하나가 피드 전체의 배치를 죽이는 셈이라
+    // '망가진 XML은 빈 배열을 돌려준다' 계약이 지키려는 것과 같은 문제다.
+    const feed = `<rss><channel>
+      <item><title>정상 기사</title><link>https://x/1</link></item>
+      <item><title>&#1114112;</title><link>https://x/2</link></item>
+    </channel></rss>`
+    const items = parseRssFeed(feed)
+    expect(items).toHaveLength(2)
+    expect(items[0]!.title).toBe('정상 기사')
+    expect(items[1]!.title).toBe('&#1114112;')
+  })
 })
 
 describe('decodeEntities', () => {
@@ -72,5 +100,23 @@ describe('decodeEntities', () => {
 
   it('일반적인 단일 인코딩은 그대로 디코딩한다', () => {
     expect(decodeEntities('&quot;hi&quot; &#039;there&#039; A&amp;B')).toBe('"hi" \'there\' A&B')
+  })
+
+  it('범위를 벗어난 숫자 문자 참조는 던지지 않고 원문 그대로 남긴다', () => {
+    // String.fromCodePoint 는 U+10FFFF(1114111)를 넘으면 RangeError 를 던진다.
+    // 인식 못 하는 named entity를 원문 그대로 돌려주는 것과 같은 원칙으로,
+    // 범위를 벗어난 숫자 참조도 원문 그대로 남긴다.
+    expect(decodeEntities('&#1114112;')).toBe('&#1114112;')
+    expect(decodeEntities('&#99999999999999;')).toBe('&#99999999999999;')
+    expect(decodeEntities('&#x110000;')).toBe('&#x110000;')
+  })
+
+  it('회귀 방지: 엔티티로 인식되지 않아야 할 입력은 그대로 남고, 유효 범위 안의 외톨이 서로게이트는 정상 디코딩된다', () => {
+    expect(decodeEntities('&#;')).toBe('&#;')
+    expect(decodeEntities('&quot')).toBe('&quot')
+    expect(decodeEntities('A & B & C')).toBe('A & B & C')
+    // U+D800 은 외톨이 서로게이트라 유효한 문자열은 아니지만, 유효 코드포인트
+    // 범위(0~U+10FFFF) 안에 있어 String.fromCodePoint 가 던지지 않고 받아준다.
+    expect(decodeEntities('&#55296;')).toBe(String.fromCodePoint(55296))
   })
 })
