@@ -69,7 +69,7 @@ export function formatNewsMerged(
   const head = `📰 뉴스 ${items.length}건`
   const body = items.map(({ event, tier }) => {
     const raw = event.raw as { press?: string } | null
-    const press = typeof raw?.press === 'string' ? `[${escapeMarkdownV2(raw.press)}] ` : ''
+    const press = typeof raw?.press === 'string' ? `\\[${escapeMarkdownV2(raw.press)}\\] ` : ''
     return `${TIER_MARK[tier]} ${press}${escapeMarkdownV2(event.title)}\n${escapeMarkdownV2(event.url)}`
   })
   return [head, '', ...body, '', DISCLAIMER].join('\n')

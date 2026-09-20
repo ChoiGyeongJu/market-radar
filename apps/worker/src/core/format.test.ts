@@ -158,3 +158,76 @@ describe('formatNewsMerged', () => {
     expect(s).toContain('연합뉴스')
   })
 })
+
+describe('reserved character invariant — 뉴스 메시지의 MarkdownV2 유효성', () => {
+  const RESERVED_CHARS = '_*[]()~`>#+\\-=|{}.!'
+
+  // Telegram MarkdownV2에서 예약문자가 이스케이프되지 않으면 400 에러로 메시지 손실.
+  // 의도적 마크업 외의 모든 예약문자는 반드시 이스케이프되어야 한다.
+  function assertNoUnescapedReserved(output: string, intentionalMarkup: string[]): void {
+    // 의도적 마크업이 위치한 범위를 먼저 표시
+    const intentionalRanges: [number, number][] = []
+    for (const markup of intentionalMarkup) {
+      let idx = 0
+      while ((idx = output.indexOf(markup, idx)) !== -1) {
+        intentionalRanges.push([idx, idx + markup.length])
+        idx += markup.length
+      }
+    }
+
+    let i = 0
+    while (i < output.length) {
+      const char = output.charAt(i)
+
+      // 백슬래시-예약문자 시퀀스는 정상적인 이스케이프
+      if (char === '\\' && i + 1 < output.length && RESERVED_CHARS.includes(output.charAt(i + 1))) {
+        i += 2
+        continue
+      }
+
+      if (!RESERVED_CHARS.includes(char)) {
+        i++
+        continue
+      }
+
+      // 이 위치가 의도적 마크업 범위에 포함되는지 확인
+      let isIntentional = false
+      for (const [start, end] of intentionalRanges) {
+        if (i >= start && i < end) {
+          isIntentional = true
+          break
+        }
+      }
+
+      if (!isIntentional) {
+        const context = output.substring(Math.max(0, i - 20), i + 20)
+        throw new Error(
+          `예약문자 미이스케이프: '${char}' at position ${i} in: "${context}"`
+        )
+      }
+
+      i++
+    }
+  }
+
+  it('formatNewsEvent의 모든 예약문자가 이스케이프되거나 의도적 마크업이다', () => {
+    const challenging = newsEvent('한미약품 [주] (주) 수주.계약 - 1분기!테스트')
+    const s = formatNewsEvent(challenging, 'high')
+
+    // 의도적 마크업: *뉴스*, DISCLAIMER (이미 _ 포함)
+    const intentional = ['*뉴스*', DISCLAIMER]
+    assertNoUnescapedReserved(s, intentional)
+  })
+
+  it('formatNewsMerged의 모든 예약문자가 이스케이프되거나 의도적 마크업이다', () => {
+    const e = {
+      ...newsEvent('한국[은행].주식-회사 (공공기관) 자금.조달!계획'),
+      raw: { feedId: 'test', press: '매일[경제]신문-보도' },
+    }
+    const s = formatNewsMerged([{ event: e, tier: 'high' }])
+
+    // 의도적 마크업: \[ \] (이스케이프된 괄호), DISCLAIMER (이미 _ 포함)
+    const intentional = [`\\[`, `\\]`, DISCLAIMER]
+    assertNoUnescapedReserved(s, intentional)
+  })
+})
