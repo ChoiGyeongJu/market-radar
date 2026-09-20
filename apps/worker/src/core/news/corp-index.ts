@@ -60,8 +60,11 @@ export function matchCorp(text: string, index: CorpIndex): CorpEntry | null {
       while (idx !== -1 && !hasValidBoundary) {
         const before = idx === 0 ? ' ' : text[idx - 1]!
         const after = idx + e.name.length >= text.length ? ' ' : text[idx + e.name.length]!
-        // 이 등장이 경계 조건을 만족하면 매칭 가능
-        if (!/[A-Za-z0-9]/.test(before) && !/[A-Za-z0-9]/.test(after)) {
+        // 이 등장이 경계 조건을 만족하면 매칭 가능.
+        // '&' 는 삼성E&A·동원F&B 처럼 회사명 내부에 쓰이는 문자라 경계가
+        // 아니다 — 영문/숫자 이웃과 똑같이 취급해야 KT&G 안의 "KT" 가
+        // 별개 회사(KT, 030200)로 오귀속되지 않는다.
+        if (!/[A-Za-z0-9&]/.test(before) && !/[A-Za-z0-9&]/.test(after)) {
           hasValidBoundary = true
         }
         idx = text.indexOf(e.name, idx + 1)
@@ -85,6 +88,11 @@ export function matchCorp(text: string, index: CorpIndex): CorpEntry | null {
  * 한국전력은 누락이 아니라 오귀속을 고친다 — 등록명이 한국전력공사라
  * 기사의 "한국전력" 이 별개 상장사 "국전" 에 잡히고 있었다. 별칭(4자)이
  * 국전(2자)보다 길어 긴 이름 우선 규칙이 먼저 잡는다.
+ *
+ * KT&G 는 등록명이 "케이티앤지"라 뉴스 표기와 전혀 안 겹친다. `&` 를
+ * 경계 문자에서 제외한 수정(matchCorp) 덕에 "KT&G" 안의 "KT" 가 별개
+ * 회사(KT, 030200)로 오귀속되진 않지만, 별칭이 없으면 no-corp-match 로
+ * 빠진다 — 그래서 별도로 추가한다.
  */
 export const CORP_ALIASES: ReadonlyArray<{ alias: string; ticker: string }> = [
   { alias: '현대차', ticker: '005380' },
@@ -93,4 +101,5 @@ export const CORP_ALIASES: ReadonlyArray<{ alias: string; ticker: string }> = [
   { alias: '삼성화재', ticker: '000810' },
   { alias: '에쓰오일', ticker: '010950' },
   { alias: '한국전력', ticker: '015760' },
+  { alias: 'KT&G', ticker: '033780' },
 ]

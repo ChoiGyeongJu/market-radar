@@ -14,6 +14,8 @@ const INDEX = buildCorpIndex([
   { name: 'SK하이닉스', ticker: '000660' },  // 혼합 한글 이름
   { name: 'LG전자', ticker: '003550' },      // 혼합 한글 이름
   { name: 'DB하이텍', ticker: '000000' },    // 혼합 한글 이름
+  { name: 'KT', ticker: '030200' },          // & 경계 테스트용
+  { name: 'KT&G', ticker: '033780' },        // & 경계 테스트용
 ])
 
 describe('matchCorp', () => {
@@ -85,5 +87,28 @@ describe('matchCorp', () => {
     expect(matchCorp('LG전자 실적 발표', INDEX)?.ticker).toBe('003550')
     // DB하이텍도 경계 확인 없이 매칭
     expect(matchCorp('DB하이텍 주가 20만원 목표', INDEX)?.ticker).toBe('000000')
+  })
+
+  it('&는 회사명 내부 문자다 — 경계로 인정하지 않는다', () => {
+    // 명부에 KT&G가 없는 경우를 따로 격리해서 검증한다 — INDEX 전체로 테스트하면
+    // 더 긴 "KT&G" 항목이 text.includes 로 먼저 잡혀 루프가 "KT" 까지 가지 않으므로
+    // 경계 로직 자체는 검증되지 않는다(수정 전 회귀와 똑같이 통과해버린다).
+    const ktOnly = buildCorpIndex([{ name: 'KT', ticker: '030200' }])
+    // KT&G 안의 "KT" 가 별개 회사(KT, 030200)로 오귀속되면 안 됨.
+    expect(matchCorp('KT&G, 3분기 영업이익 15% 증가', ktOnly)).toBeNull()
+    expect(matchCorp('KT&G 목표주가 상향', ktOnly)).toBeNull()
+    // 독립 토큰 KT는 여전히 매칭돼야 한다 — & 수정이 일반 경계 판정을 깨면 안 됨.
+    expect(matchCorp('KT, 5G 요금제 개편 주가 상승', ktOnly)?.ticker).toBe('030200')
+
+    // 명부에 KT&G(별칭 포함)도 있으면 더 긴 이름이 우선해 KT&G로 매칭돼야 한다.
+    const match = matchCorp('KT&G, 3분기 영업이익 15% 증가', INDEX)
+    expect(match?.ticker).not.toBe('030200')
+    expect(match?.ticker).toBe('033780')
+    expect(matchCorp('KT&G 목표주가 상향', INDEX)?.ticker).toBe('033780')
+    expect(matchCorp('KT, 5G 요금제 개편 주가 상승', INDEX)?.ticker).toBe('030200')
+
+    // 기존 라틴 경계 회귀 확인 — & 수정과 무관하게 그대로 동작해야 한다.
+    expect(matchCorp('SKY캐슬 후속작 관련주 급등, 증시 훈풍', INDEX)).toBeNull()
+    expect(matchCorp('SKT 요금제 개편, SK 주가 강세', INDEX)?.ticker).toBe('001200')
   })
 })

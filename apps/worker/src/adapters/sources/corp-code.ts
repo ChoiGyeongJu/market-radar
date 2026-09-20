@@ -1,5 +1,6 @@
 import { unzipSync, strFromU8 } from 'fflate'
 import { CORP_ALIASES, type CorpEntry } from '../../core/news/corp-index.js'
+import { decodeEntities } from '../../core/news/rss.js'
 
 const ENDPOINT = 'https://opendart.fss.or.kr/api/corpCode.xml'
 
@@ -8,9 +9,15 @@ const REQUEST_TIMEOUT_MS = 30_000
 
 const LIST_RE = /<list>([\s\S]*?)<\/list>/g
 
+/**
+ * DART 는 법인명을 XML 이스케이프해서 준다 — 실측 20개사가 "삼성E&amp;A"
+ * 처럼 등록돼 있어 디코딩하지 않으면 뉴스의 "삼성E&A" 와 영원히 안 맞는다.
+ * 디코더는 새로 만들지 않고 rss.ts 의 것을 재사용한다 — 엔티티 디코딩은
+ * 한 곳에서만 옳으면 된다.
+ */
 function field(block: string, name: string): string {
   const m = new RegExp(`<${name}>([\\s\\S]*?)</${name}>`).exec(block)
-  return (m?.[1] ?? '').trim()
+  return decodeEntities(m?.[1] ?? '').trim()
 }
 
 /**
