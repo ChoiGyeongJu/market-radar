@@ -136,20 +136,21 @@ describe('createRssSource', () => {
     expect((f.mock.calls[2]![1] as RequestInit).headers).not.toHaveProperty('If-None-Match')
   })
 
-  it('한 피드가 느려도 나머지는 순차 합이 아니라 동시에 처리된다', async () => {
-    const HANG_MS = 100
-    const PROMPT_MS = 60
-    // 실제 10초 타임아웃을 기다리지 않도록, 짧은 지연 뒤 타임아웃과 같은 모양으로
-    // reject 하는 가짜를 쓴다 — REQUEST_TIMEOUT_MS 자체는 건드리지 않는다.
+  it('한 피드가 응답하지 않아도 나머지는 그 전에 이미 요청된다 — 순차가 아니라 동시', async () => {
+    // 시간을 재는 대신 순서를 잰다: 느린 피드가 아직 안 끝났는데도 빠른 피드의
+    // 요청이 이미 나갔는지를 직접 확인한다. 이러면 CI 러너가 얼마나 느리든
+    // 결과가 흔들리지 않는다 — elapsed 를 재던 이전 버전은 부하가 큰 러너에서
+    // 여유 마진(30ms)을 넘길 수 있었다.
+    const requestOrder: string[] = []
+    let releaseHang!: () => void
+    const hang = new Promise<Response>((_, reject) => {
+      releaseHang = () => reject(new DOMException('The operation was aborted.', 'AbortError'))
+    })
+
     const f = vi.fn((url: string) => {
-      if (url === 'https://f/hang') {
-        return new Promise<Response>((_, reject) => {
-          setTimeout(() => reject(new DOMException('The operation was aborted.', 'AbortError')), HANG_MS)
-        })
-      }
-      return new Promise<Response>((resolve) => {
-        setTimeout(() => resolve(new Response(FEED('신속', 'https://x/prompt'), { status: 200 })), PROMPT_MS)
-      })
+      requestOrder.push(url)
+      if (url === 'https://f/hang') return hang
+      return Promise.resolve(new Response(FEED('신속', 'https://x/prompt'), { status: 200 }))
     })
     const src = createRssSource({
       feeds: [
@@ -159,14 +160,20 @@ describe('createRssSource', () => {
       fetchImpl: f as unknown as typeof fetch,
     })
 
-    const start = Date.now()
-    const out = await src.fetchLatest(NOW)
-    const elapsed = Date.now() - start
+    const pending = src.fetchLatest(NOW)
+
+    // fetchLatest 가 각 피드의 fetch 를 Promise.allSettled(feeds.map(...)) 로
+    // 동시에 시작한다면, hang 이 아직 reject 되지 않은 이 시점에 이미 두 URL
+    // 모두 f 에 전달돼 있어야 한다. 순차 구현(for...of await)이었다면 hang 이
+    // 걸려 있는 한 prompt 요청은 아예 나가지 않는다 — hang 을 풀어주기 전까지는
+    // 영원히.
+    expect(requestOrder).toContain('https://f/hang')
+    expect(requestOrder).toContain('https://f/prompt')
+
+    releaseHang()
+    const out = await pending
 
     expect(out).toHaveLength(1)
     expect(out[0]!.title).toBe('신속')
-    // 순차였다면 HANG_MS + PROMPT_MS(약 160ms) 근처까지 걸린다.
-    // 동시라면 둘 중 더 오래 걸리는 쪽(HANG_MS, 약 100ms)에 근접해야 한다.
-    expect(elapsed).toBeLessThan(HANG_MS + PROMPT_MS * 0.5)
   })
 })
