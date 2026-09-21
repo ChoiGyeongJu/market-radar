@@ -3,7 +3,9 @@ import type { NormalizedEvent } from '@app/shared'
 import type { EventStore, PendingOutbox } from '../ports/store.js'
 import type { Notifier } from '../ports/notifier.js'
 import { LOCAL_RATE_LIMIT } from '../ports/notifier.js'
-import { MAX_MERGED_CHARS } from '../core/policy.js'
+import type { Summarizer } from '../ports/summarizer.js'
+import { MAX_MERGED_CHARS, MERGE_THRESHOLD } from '../core/policy.js'
+import { formatMerged, formatNewsEvent, formatNewsMerged } from '../core/format.js'
 import { noopSummarizer } from '../adapters/summarizer/noop.js'
 import { runDispatch } from './dispatch.js'
 
@@ -15,6 +17,15 @@ const event: NormalizedEvent = {
   subject: { name: '샘플', ticker: '005930', market: 'Y' }, raw: {},
 }
 
+// 뉴스 이벤트는 subject 가 없다 — dispatch 가 뉴스에 formatMerged/formatEvent를
+// 잘못 태우면(subjectLine이 undefined를 찍거나 예외를 던짐) 아래 라우팅
+// 테스트들이 이를 잡아낸다.
+const newsEvent: NormalizedEvent = {
+  sourceId: 'news', externalId: 'yna-market:1', occurredAt: null, firstSeenAt: NOW,
+  title: '삼성전자 신규 수주 계약', url: 'https://news.example.test/1',
+  raw: { feedId: 'yna-market', press: '연합뉴스' },
+}
+
 function pending(over: Partial<PendingOutbox> = {}): PendingOutbox {
   return {
     id: 1, eventId: 10, tier: 'critical', event,
@@ -22,7 +33,14 @@ function pending(over: Partial<PendingOutbox> = {}): PendingOutbox {
   }
 }
 
-function deps(items: PendingOutbox[], send: Notifier['send']) {
+function newsPending(over: Partial<PendingOutbox> = {}): PendingOutbox {
+  return {
+    id: 100, eventId: 110, tier: 'critical', event: newsEvent,
+    attempts: 0, expiresAt: new Date(NOW.getTime() + 300_000), ...over,
+  }
+}
+
+function deps(items: PendingOutbox[], send: Notifier['send'], summarizer: Summarizer = noopSummarizer) {
   const markSent = vi.fn(async () => {})
   // vi.fn<EventStore['markFailed']>: 아래 회귀 테스트가 markFailed.mock.calls[0]![3]으로
   // attempts를 꺼내 다음 사이클에 되먹인다 — 타입 인자가 없으면 dispatch.ts의 마지막 테스트와
@@ -34,7 +52,7 @@ function deps(items: PendingOutbox[], send: Notifier['send']) {
     markSent, markFailed, markDead,
   } as unknown as EventStore
   return {
-    deps: { store, notifier: { send }, summarizer: noopSummarizer },
+    deps: { store, notifier: { send }, summarizer },
     markSent, markFailed, markDead,
   }
 }
@@ -219,6 +237,154 @@ describe('runDispatch', () => {
       expect(markDead).not.toHaveBeenCalled()
 
       expect(stats.sent).toBe(3)
+    },
+  )
+})
+
+describe('runDispatch — 뉴스 라우팅 (소스별 포맷·순서·병합 임계)', () => {
+  it(
+    'critical 개별 발송은 공시를 먼저 보낸다 — 공유 토큰 버킷이 뉴스로 먼저 마르면 ' +
+      '뒤따르는 공시 critical 이 LOCAL_RATE_LIMIT 로 밀려 5분 TTL 안에 만료될 수 있다',
+    async () => {
+      const send = vi.fn<Notifier['send']>(async () => ({ ok: true as const }))
+      // claim 순서는 일부러 뉴스를 앞에 둔다 — dispatch가 입력 순서를 그대로
+      // 따르기만 해서는 이 테스트를 통과할 수 없어야 한다(재정렬을 증명한다).
+      const items = [
+        newsPending({ id: 101 }),
+        pending({ id: 1 }),
+        newsPending({ id: 102 }),
+        pending({ id: 2 }),
+      ]
+      const { deps: d } = deps(items, send)
+
+      await runDispatch(d, NOW)
+
+      expect(send).toHaveBeenCalledTimes(4)
+      const texts = send.mock.calls.map((c) => String(c[0]))
+      // 앞의 두 통은 공시(제목에 "무상증자결정"), 뒤의 두 통은 뉴스(헤더에 "뉴스")여야 한다.
+      expect(texts[0]).toContain('무상증자결정')
+      expect(texts[1]).toContain('무상증자결정')
+      expect(texts[2]).toContain('*뉴스*')
+      expect(texts[3]).toContain('*뉴스*')
+    },
+  )
+
+  it(
+    '뉴스가 임계(MERGE_THRESHOLD) 이상이면 formatNewsMerged 로 병합되고 헤더가 "뉴스"다 — ' +
+      '자리가 뒤바뀐 튜플([newsOthers, formatMerged])이었다면 subject 없는 뉴스에서 ' +
+      'undefined 를 찍거나 "공시" 헤더를 달았을 것이다',
+    async () => {
+      const send = vi.fn<Notifier['send']>(async () => ({ ok: true as const }))
+      const items = [1, 2, 3].map((id) => newsPending({ id, tier: 'high' }))
+      const { deps: d, markSent } = deps(items, send)
+
+      const stats = await runDispatch(d, NOW)
+
+      expect(send).toHaveBeenCalledTimes(1)
+      const text = String(send.mock.calls[0]![0])
+      expect(text).toContain('뉴스 3건')
+      expect(text).not.toContain('공시')
+      expect(text).not.toContain('undefined')
+      expect(text).toBe(formatNewsMerged(items.map((i) => ({ event: i.event, tier: i.tier }))))
+      expect(stats.sent).toBe(3)
+      expect(markSent).toHaveBeenCalledTimes(3)
+    },
+  )
+
+  it(
+    '뉴스가 임계 미만이면 formatNewsEvent 로 개별 발송되고 요약기를 타지 않는다',
+    async () => {
+      const summarize = vi.fn(async () => 'LLM이 실제로 불렸다면 이 문자열이 찍혀야 한다')
+      const send = vi.fn<Notifier['send']>(async () => ({ ok: true as const }))
+      const items = [1, 2].map((id) => newsPending({ id, tier: 'high' }))
+      const { deps: d, markSent } = deps(items, send, { summarize })
+
+      const stats = await runDispatch(d, NOW)
+
+      expect(send).toHaveBeenCalledTimes(2)
+      expect(summarize).not.toHaveBeenCalled()
+      for (const [i, item] of items.entries()) {
+        expect(String(send.mock.calls[i]![0])).toBe(formatNewsEvent(item.event, item.tier))
+      }
+      expect(stats.sent).toBe(2)
+      expect(markSent).toHaveBeenCalledTimes(2)
+    },
+  )
+
+  it(
+    '공시 2건 + 뉴스 2건(합계 4, 임계 이상)은 각각 병합되어 메시지 두 통만 나가고 ' +
+      '서로의 항목을 담지 않는다 — 그룹별로 임계를 따로 매기면 각 그룹이 개별 미달이라 ' +
+      '넷 다 낱개 발송된다(버킷 토큰을 실제보다 더 쓰고, 요약기가 붙으면 공시 2건이 ' +
+      '병합 경로에서는 안 타는 LLM 호출·최대 30초 지연을 다시 짊어진다)',
+    async () => {
+      const send = vi.fn<Notifier['send']>(async () => ({ ok: true as const }))
+      expect(2 + 2).toBeGreaterThanOrEqual(MERGE_THRESHOLD) // 이 테스트의 전제
+      const items = [
+        pending({ id: 1, tier: 'high' }),
+        pending({ id: 2, tier: 'high' }),
+        newsPending({ id: 101, tier: 'high' }),
+        newsPending({ id: 102, tier: 'high' }),
+      ]
+      const { deps: d, markSent } = deps(items, send)
+
+      const stats = await runDispatch(d, NOW)
+
+      expect(send).toHaveBeenCalledTimes(2)
+      const texts = send.mock.calls.map((c) => String(c[0]))
+      const dartText = texts.find((t) => t.includes('공시'))!
+      const newsText = texts.find((t) => t.includes('뉴스'))!
+      expect(dartText).toContain('공시 2건')
+      expect(newsText).toContain('뉴스 2건')
+      // 서로의 항목을 담지 않는다.
+      expect(dartText).not.toContain('삼성전자 신규 수주 계약')
+      expect(newsText).not.toContain('무상증자결정')
+      expect(stats.sent).toBe(4)
+      expect(markSent).toHaveBeenCalledTimes(4)
+    },
+  )
+
+  it(
+    '뉴스 병합도 MAX_MERGED_CHARS 를 넘으면 잘라서 보낸다 — 항목당 본문에 매체명 ' +
+      '대괄호가 붙어 공시보다 길므로(formatNewsMerged), 컷오프 지점이 공시와 다르다',
+    async () => {
+      const longTitle = 'A'.repeat(900)
+      const longNewsEvent: NormalizedEvent = { ...newsEvent, title: longTitle }
+      // 티커 없는 공시로 비교한다 — 매체명 대괄호(뉴스)가 "*이름* \(티커\) — "(공시)
+      // 보다 짧을 수도 있어(티커가 있으면 공시가 더 길다), 이 테스트가 원하는
+      // "뉴스가 더 긴" 상황을 확실히 재현하려면 공시 쪽 오버헤드를 줄여야 한다.
+      const longDartEvent: NormalizedEvent = { ...event, title: longTitle, subject: { name: '샘플' } }
+
+      // 전제 고정: 같은 제목 길이라도 뉴스 항목 하나의 병합 본문이 공시보다 길다.
+      const oneNews = formatNewsMerged([{ event: longNewsEvent, tier: 'high' }])
+      const oneDart = formatMerged([{ event: longDartEvent, tier: 'high' }])
+      expect(oneNews.length).toBeGreaterThan(oneDart.length)
+
+      const send = vi.fn<Notifier['send']>(async () => ({ ok: true as const }))
+      const items = [1, 2, 3, 4, 5].map((id) =>
+        newsPending({ id, tier: 'high', event: longNewsEvent }),
+      )
+
+      // 컷오프는 fmt(formatNewsMerged) 자체로 미리 계산한다 — 공시 테스트의
+      // 하드코딩된 3건이라는 값을 뉴스에 그대로 재사용할 수 없다.
+      let cutoff = 0
+      for (let n = 1; n <= items.length; n += 1) {
+        const text = formatNewsMerged(items.slice(0, n).map((i) => ({ event: i.event, tier: i.tier })))
+        if (text.length > MAX_MERGED_CHARS) break
+        cutoff = n
+      }
+      expect(cutoff).toBeGreaterThan(0)
+      expect(cutoff).toBeLessThan(items.length)
+
+      const { deps: d, markSent, markFailed, markDead } = deps(items, send)
+      const stats = await runDispatch(d, NOW)
+
+      expect(send).toHaveBeenCalledTimes(1)
+      expect(String(send.mock.calls[0]![0]).length).toBeLessThanOrEqual(MAX_MERGED_CHARS)
+      expect(stats.sent).toBe(cutoff)
+      for (let i = 1; i <= cutoff; i += 1) expect(markSent).toHaveBeenCalledWith(i)
+      for (let i = cutoff + 1; i <= items.length; i += 1) expect(markSent).not.toHaveBeenCalledWith(i)
+      expect(markFailed).not.toHaveBeenCalled()
+      expect(markDead).not.toHaveBeenCalled()
     },
   )
 })

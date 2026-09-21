@@ -28,37 +28,14 @@ async function main(): Promise<void> {
   const db = drizzle(sql) as unknown as Db
   const store = createPostgresStore(db)
   // 공시 소스는 NEWS_ENABLED 와 무관하게 항상 켜져 있다. 주기·예산·판정은
-  // 기존 동작 그대로다.
+  // 기존 동작 그대로다. 뉴스 소스는 DB 의존 기동 작업(아래) 뒤에 붙인다 —
+  // 이유는 그 지점의 주석 참고.
   const plans: SourcePlan[] = [{
     source: createDartSource({ apiKey: cfg.dartApiKey }),
     evaluate: evaluateDart,
     intervalMs: pollIntervalMs,
     countsAgainstApiBudget: true,
   }]
-
-  if (cfg.newsEnabled) {
-    // 명부를 못 받으면 기동을 중단한다 — throw 를 여기서 삼키지 않는다. 빈 명부로
-    // 돌면 모든 뉴스가 no-corp-match 로 drop 되면서 워커는 정상으로 보이고
-    // 알림만 0건이 된다 (fetchCorpEntries 주석 참고).
-    const corpIndex = buildCorpIndex(await fetchCorpEntries(cfg.dartApiKey))
-    const rss = createRssSource({
-      feeds: FEEDS,
-      // 콜백을 넘기지 않으면 죽은 피드가 흔적 없이 사라진다.
-      onFeedError: (feedId, err) => log.error({ err, feedId }, 'rss feed failed'),
-    })
-    log.info({ corps: corpIndex.byLength.length, feeds: FEEDS.length }, 'news source enabled')
-    plans.push({
-      source: rss,
-      // description 은 판정에만 쓰고 이벤트에 담지 않으므로 여기서 꺼내 넘긴다.
-      // rss.descriptionOf 는 fetchLatest 가 매 호출마다 통째로 교체하는 맵을
-      // 읽으므로, 반드시 같은 사이클 안에서(이 이벤트를 만든 fetchLatest 직후)
-      // 평가해야 한다 — 이벤트를 사이클 밖으로 들고 나가 나중에 평가하면
-      // description 이 이미 다음 fetch 로 교체되어 빈 문자열을 읽는다.
-      evaluate: (e) => evaluateNews(e, corpIndex, rss.descriptionOf(e.externalId)),
-      intervalMs: () => cfg.newsIntervalMs,
-      countsAgainstApiBudget: false,
-    })
-  }
   const notifier = createTelegramNotifier(cfg.telegram)
   // 운영자 채널이 설정되면 다이제스트와 장애 알림만 그쪽으로 뺀다. 토큰 버킷은
   // 인스턴스마다 따로인데, 텔레그램의 분당 한도가 채팅 단위라 이쪽이 맞다.
@@ -103,16 +80,50 @@ async function main(): Promise<void> {
   for (const p of plans) {
     seen.set(p.source.id, createSeenSet(await store.recentExternalIds(p.source.id, SEEN_CAPACITY)))
   }
-  // 첫 사이클은 기록만 하고 한 건도 발송하지 않는다. 워커는 자신이 얼마나 오래
-  // 죽어 있었는지 알 수 없으므로, 처음 보는 물량이 신규 1건인지 사흘치 밀린
-  // 것인지 구분할 방법이 없다 (스펙 §6.4). 새로 붙인 소스도 첫 사이클은 동일하다.
-  const coldStart = new Map(plans.map((p) => [p.source.id, true]))
-  const nextRunAt = new Map(plans.map((p) => [p.source.id, 0]))
 
   // lastDigestDate 를 메모리에서만 초기화하면 KST 자정을 넘긴 재기동이 그 값을
   // 오늘로 되돌려 전날 다이제스트가 영영 발송되지 않는다 — 따라잡기 루프가
   // 통째로 무력화된다. DB 의 마지막 이벤트 날짜에서 복원한다.
   const lastDigestDate = (await store.lastEventKstDate()) ?? kstDateString(new Date())
+
+  if (cfg.newsEnabled) {
+    // 명부(수 MB)는 여기, 즉 DB 의존 기동 작업(위의 seen·lastDigestDate 조회)이
+    // 이미 성공한 뒤에만 받는다. DB 호출보다 앞에 두면 DB 장애 시 기동이 명부를
+    // 다 받은 *뒤에* 던지고, --restart always 가 매번(최대 분당 1회) 재기동시켜
+    // 장애가 지속되는 동안 계속 다시 받는다 — 이 DART 호출은 countsAgainstApiBudget
+    // 가 false 라 api_usage 에도 잡히지 않아 예산 가드가 그 낭비를 보지도 못한다.
+    //
+    // 못 받으면 기동을 중단한다 — throw 를 여기서 삼키지 않는다. 빈 명부로 돌면
+    // 모든 뉴스가 no-corp-match 로 drop 되면서 워커는 정상으로 보이고 알림만
+    // 0건이 된다 (fetchCorpEntries 주석 참고).
+    const corpIndex = buildCorpIndex(await fetchCorpEntries(cfg.dartApiKey))
+    const rss = createRssSource({
+      feeds: FEEDS,
+      // 콜백을 넘기지 않으면 죽은 피드가 흔적 없이 사라진다.
+      onFeedError: (feedId, err) => log.error({ err, feedId }, 'rss feed failed'),
+    })
+    log.info({ corps: corpIndex.byLength.length, feeds: FEEDS.length }, 'news source enabled')
+    plans.push({
+      source: rss,
+      // description 은 판정에만 쓰고 이벤트에 담지 않으므로 여기서 꺼내 넘긴다.
+      // rss.descriptionOf 는 fetchLatest 가 매 호출마다 통째로 교체하는 맵을
+      // 읽으므로, 반드시 같은 사이클 안에서(이 이벤트를 만든 fetchLatest 직후)
+      // 평가해야 한다 — 이벤트를 사이클 밖으로 들고 나가 나중에 평가하면
+      // description 이 이미 다음 fetch 로 교체되어 빈 문자열을 읽는다.
+      evaluate: (e) => evaluateNews(e, corpIndex, rss.descriptionOf(e.externalId)),
+      intervalMs: () => cfg.newsIntervalMs,
+      countsAgainstApiBudget: false,
+    })
+    // 위 seen 시딩 루프가 돌 때는 뉴스 플랜이 아직 plans 에 없었으므로 따로 심는다.
+    seen.set(rss.id, createSeenSet(await store.recentExternalIds(rss.id, SEEN_CAPACITY)))
+  }
+
+  // 첫 사이클은 기록만 하고 한 건도 발송하지 않는다. 워커는 자신이 얼마나 오래
+  // 죽어 있었는지 알 수 없으므로, 처음 보는 물량이 신규 1건인지 사흘치 밀린
+  // 것인지 구분할 방법이 없다 (스펙 §6.4). 새로 붙인 소스도 첫 사이클은 동일하다.
+  // plans 가 이 시점(뉴스 플랜을 붙였다면 그 뒤)에 확정되므로 여기서 만든다.
+  const coldStart = new Map(plans.map((p) => [p.source.id, true]))
+  const nextRunAt = new Map(plans.map((p) => [p.source.id, 0]))
 
   log.info(
     {
