@@ -1,5 +1,8 @@
 import { describe, it, expect } from 'vitest'
-import { parseRssFeed, decodeEntities } from './rss.js'
+import {
+  parseRssFeed, decodeEntities,
+  MAX_ITEMS_PER_FEED, MAX_TITLE_CHARS, MAX_DESCRIPTION_CHARS,
+} from './rss.js'
 
 const FEED = `<?xml version="1.0" encoding="UTF-8"?>
 <rss version="2.0"><channel>
@@ -118,5 +121,70 @@ describe('decodeEntities', () => {
     // U+D800 은 외톨이 서로게이트라 유효한 문자열은 아니지만, 유효 코드포인트
     // 범위(0~U+10FFFF) 안에 있어 String.fromCodePoint 가 던지지 않고 받아준다.
     expect(decodeEntities('&#55296;')).toBe(String.fromCodePoint(55296))
+  })
+})
+
+/**
+ * 입력 상한. 공시 어댑터는 목록 API 가 프로토콜상 100건으로 막아 주지만 RSS 에는
+ * 그런 상한이 없다 — 피드가 재설정되거나 CDN 이 아카이브를 물려주면 한 응답에
+ * 수만 건이 들어오고, runIngest 는 처음 보는 item 마다 recordEvent 트랜잭션을
+ * 하나씩 직렬로 돌린다. 그 사이 같은 스레드의 공시 폴링이 멎는다.
+ */
+describe('parseRssFeed — 입력 상한', () => {
+  const item = (i: number, title = `기사 ${i}`, description = '본문') => `
+  <item>
+    <title>${title}</title>
+    <link>https://example.com/${i}</link>
+    <guid>https://example.com/${i}</guid>
+    <description>${description}</description>
+  </item>`
+  const feedOf = (items: string) =>
+    `<?xml version="1.0" encoding="UTF-8"?><rss version="2.0"><channel>${items}</channel></rss>`
+
+  it('item 이 아무리 많아도 피드당 100건까지만 받아들인다', () => {
+    const xml = feedOf(Array.from({ length: 20_000 }, (_, i) => item(i)).join(''))
+
+    const items = parseRssFeed(xml)
+
+    expect(items).toHaveLength(MAX_ITEMS_PER_FEED)
+    expect(MAX_ITEMS_PER_FEED).toBe(100)
+  })
+
+  it('상한을 넘겨도 앞(최신)에서부터 남긴다 — 뒤를 남기면 새 기사를 못 본다', () => {
+    const xml = feedOf(Array.from({ length: 150 }, (_, i) => item(i)).join(''))
+
+    const items = parseRssFeed(xml)
+
+    expect(items[0]!.link).toBe('https://example.com/0')
+    expect(items[99]!.link).toBe('https://example.com/99')
+  })
+
+  it('상한 미만이면 그대로 전부 돌려준다 — 정상 피드 동작은 바뀌지 않는다', () => {
+    const xml = feedOf(Array.from({ length: 12 }, (_, i) => item(i)).join(''))
+
+    expect(parseRssFeed(xml)).toHaveLength(12)
+  })
+
+  it('제목은 500자에서 자른다 — 저장되고 발송되는 값이라 상한이 없으면 메시지가 한도를 넘는다', () => {
+    const long = 'A'.repeat(5_000)
+    const items = parseRssFeed(feedOf(item(1, long)))
+
+    expect(items[0]!.title).toHaveLength(MAX_TITLE_CHARS)
+    expect(MAX_TITLE_CHARS).toBe(500)
+  })
+
+  it('description 은 2,000자에서 자른다 — 필터링에만 쓰지만 매 item 마다 통째로 훑는다', () => {
+    const long = '수주'.repeat(5_000)
+    const items = parseRssFeed(feedOf(item(1, '짧은 제목', long)))
+
+    expect(items[0]!.description).toHaveLength(MAX_DESCRIPTION_CHARS)
+    expect(MAX_DESCRIPTION_CHARS).toBe(2_000)
+  })
+
+  it('상한 이하의 제목·본문은 한 글자도 건드리지 않는다', () => {
+    const items = parseRssFeed(feedOf(item(1, '한미약품 수주 계약', '본문 요약')))
+
+    expect(items[0]!.title).toBe('한미약품 수주 계약')
+    expect(items[0]!.description).toBe('본문 요약')
   })
 })
