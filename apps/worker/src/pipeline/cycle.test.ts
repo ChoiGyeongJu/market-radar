@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import type { NormalizedEvent, Verdict } from '@app/shared'
+import type { Evaluation, NormalizedEvent } from '@app/shared'
 import { kstDateString } from '../core/budget.js'
 import { createCircuit, ALERT_THRESHOLD } from '../core/circuit.js'
 import type { Circuit } from '../core/circuit.js'
@@ -65,7 +65,8 @@ const source: EventSource = { id: 'dart', fetchLatest: async () => [] }
 /** 기존 단일 소스 테스트가 쓰던 공시 소스 그대로 — 주기·예산·판정이 운영과 같다. */
 const dartPlan: SourcePlan = {
   source,
-  evaluate: evaluateDart,
+  // DART 는 주체가 이미 이벤트에 실려 오므로 판정만 돌려준다 (SourcePlan.evaluate 주석).
+  evaluate: (e) => ({ verdict: evaluateDart(e) }),
   intervalMs: pollIntervalMs,
   countsAgainstApiBudget: true,
 }
@@ -420,7 +421,7 @@ describe('runCycle — 다중 소스', () => {
         id,
         fetchLatest: vi.fn(async (_now: Date): Promise<NormalizedEvent[]> => []),
       },
-      evaluate: (): Verdict => ({ action: 'drop', reason: 'test' }),
+      evaluate: (): Evaluation => ({ verdict: { action: 'drop', reason: 'test' } }),
       intervalMs: () => intervalMs,
       countsAgainstApiBudget,
     }
@@ -735,7 +736,7 @@ describe('runCycle — 다중 소스', () => {
       // 운영과 같은 구성: 주기가 곧 pollIntervalMs 다.
       const only: SourcePlan = {
         source,
-        evaluate: (): Verdict => ({ action: 'drop', reason: 'test' }),
+        evaluate: (): Evaluation => ({ verdict: { action: 'drop', reason: 'test' } }),
         intervalMs: pollIntervalMs,
         countsAgainstApiBudget: true,
       }
@@ -839,7 +840,7 @@ describe('runCycle — 다중 소스', () => {
       }
       const only: SourcePlan = {
         source,
-        evaluate: (): Verdict => ({ action: 'drop', reason: 'test' }),
+        evaluate: (): Evaluation => ({ verdict: { action: 'drop', reason: 'test' } }),
         intervalMs: pollIntervalMs,
         countsAgainstApiBudget: true,
       }

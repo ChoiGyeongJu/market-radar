@@ -46,7 +46,13 @@ function fakeSource(events: NormalizedEvent[]): EventSource {
 
 /** 공시 소스의 계획. 판정은 evaluateDart, 주기 10초, 한도 추적 대상이다. */
 function plan(source: EventSource): SourcePlan {
-  return { source, evaluate: evaluateDart, intervalMs: () => 10_000, countsAgainstApiBudget: true }
+  return {
+    source,
+    // DART 는 주체가 이미 이벤트에 실려 오므로 판정만 돌려준다.
+    evaluate: (e) => ({ verdict: evaluateDart(e) }),
+    intervalMs: () => 10_000,
+    countsAgainstApiBudget: true,
+  }
 }
 
 describe('runIngest', () => {
@@ -106,7 +112,8 @@ describe('runIngest', () => {
       { sourceId: 'news', externalId: 'n1', occurredAt: null, firstSeenAt: new Date(),
         title: '아무 제목', url: 'https://x/1', raw: {} },
     ])
-    const alwaysPass = () => ({ action: 'pass', tier: 'high', rule: 'test' }) as const
+    const alwaysPass = () =>
+      ({ verdict: { action: 'pass', tier: 'high', rule: 'test' } }) as const
     await runIngest(
       { plan: { source, evaluate: alwaysPass, intervalMs: () => 30_000, countsAgainstApiBudget: false }, store },
       { seen: createSeenSet([]), coldStart: false },
@@ -117,6 +124,105 @@ describe('runIngest', () => {
       { action: 'pass', tier: 'high', rule: 'test' },
       expect.objectContaining({ enqueue: true }),
     )
+  })
+
+  /**
+   * 판정이 알아낸 주체를 저장까지 흘려보낸다. 뉴스 판정은 상장사를 매칭해 게이트를
+   * 통과시키는데 그 결과를 버리면 events.corp_name/ticker 가 전부 NULL 이 되고,
+   * 그 값은 나중에 복구할 수 없다 — 기사는 사라지고 명부는 변한다(스펙 §6.4).
+   */
+  describe('판정이 돌려준 주체를 저장 이벤트에 붙인다', () => {
+    const newsEvent: NormalizedEvent = {
+      sourceId: 'news', externalId: 'yna:1', occurredAt: null, firstSeenAt: NOW,
+      title: '한미약품 수주 계약', url: 'https://news.test/1', raw: {},
+    }
+
+    it('subject 를 돌려주면 recordEvent 가 그 subject 를 실은 이벤트를 받는다', async () => {
+      const { store, recordEvent } = fakeStore()
+      const evaluate = () =>
+        ({
+          verdict: { action: 'pass', tier: 'high', rule: 'keyword:수주' },
+          subject: { name: '한미약품', ticker: '128940' },
+        }) as const
+
+      await runIngest(
+        {
+          plan: {
+            source: { id: 'news', fetchLatest: async () => [newsEvent] },
+            evaluate, intervalMs: () => 60_000, countsAgainstApiBudget: false,
+          },
+          store,
+        },
+        warm(),
+        NOW,
+      )
+
+      expect(recordEvent).toHaveBeenCalledWith(
+        expect.objectContaining({
+          externalId: 'yna:1',
+          subject: { name: '한미약품', ticker: '128940' },
+        }),
+        expect.anything(),
+        expect.anything(),
+      )
+    })
+
+    it('drop 판정이어도 붙인다 — 튜닝 후보 목록에 회사명이 필요한 쪽은 오히려 이쪽이다', async () => {
+      const { store, recordEvent } = fakeStore()
+      const evaluate = () =>
+        ({
+          verdict: { action: 'drop', reason: 'no-keyword-match' },
+          subject: { name: '한미약품', ticker: '128940' },
+        }) as const
+
+      await runIngest(
+        {
+          plan: {
+            source: { id: 'news', fetchLatest: async () => [newsEvent] },
+            evaluate, intervalMs: () => 60_000, countsAgainstApiBudget: false,
+          },
+          store,
+        },
+        warm(),
+        NOW,
+      )
+
+      expect(recordEvent.mock.calls[0]![0].subject).toEqual({ name: '한미약품', ticker: '128940' })
+    })
+
+    it('원본 이벤트를 제자리에서 고치지 않는다 — 소스가 만든 객체를 건드리지 않는다', async () => {
+      const { store } = fakeStore()
+      const evaluate = () =>
+        ({
+          verdict: { action: 'drop', reason: 'no-keyword-match' },
+          subject: { name: '한미약품', ticker: '128940' },
+        }) as const
+
+      await runIngest(
+        {
+          plan: {
+            source: { id: 'news', fetchLatest: async () => [newsEvent] },
+            evaluate, intervalMs: () => 60_000, countsAgainstApiBudget: false,
+          },
+          store,
+        },
+        warm(),
+        NOW,
+      )
+
+      expect(newsEvent.subject).toBeUndefined()
+    })
+
+    it('subject 가 없으면 이벤트를 그대로 넘긴다 — DART 는 이미 주체를 싣고 온다', async () => {
+      const { store, recordEvent } = fakeStore()
+      const dartEvent = mkEvent()
+
+      await runIngest({ plan: plan(fakeSource([dartEvent])), store }, warm(), NOW)
+
+      expect(recordEvent.mock.calls[0]![0]).toBe(dartEvent)
+      expect(recordEvent.mock.calls[0]![0].subject)
+        .toEqual({ name: '샘플', ticker: '005930', market: 'Y' })
+    })
   })
 })
 

@@ -6,8 +6,12 @@ import type { Notifier } from '../ports/notifier.js'
 import type { EventStore, PendingOutbox } from '../ports/store.js'
 import type { Summarizer } from '../ports/summarizer.js'
 
-// 소스별로 포맷을 가른다. 뉴스는 subject 가 없어 공시 포맷(subjectLine)을 그대로
-// 쓰면 안 되고, 병합 헤더도 "공시 N건"/"뉴스 N건" 이 서로를 대신할 수 없다.
+// 소스별로 포맷을 가른다. 병합 헤더 "공시 N건"/"뉴스 N건" 이 서로를 대신할 수
+// 없고, 공시 포맷은 뉴스에 없는 시장 구분까지 한 줄로 찍는다.
+//
+// 뉴스 이벤트도 이제 subject(회사명·종목코드)를 싣고 저장되지만, **발송 메시지는
+// 바꾸지 않는다** — 그 값은 events 행에 튜닝·라벨링 근거로 남기는 것이지 메시지에
+// 회사를 단정해 붙이려고 얻은 것이 아니다. 라우팅은 계속 sourceId 로 한다.
 const isNews = (i: PendingOutbox): boolean => i.event.sourceId === 'news'
 const one = (i: PendingOutbox, summary?: string): string =>
   isNews(i) ? formatNewsEvent(i.event, i.tier) : formatEvent(i.event, i.tier, summary)

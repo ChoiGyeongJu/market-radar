@@ -32,7 +32,9 @@ async function main(): Promise<void> {
   // 이유는 그 지점의 주석 참고.
   const plans: SourcePlan[] = [{
     source: createDartSource({ apiKey: cfg.dartApiKey }),
-    evaluate: evaluateDart,
+    // DART 는 주체(회사명·종목코드·시장)가 이미 정규화 단계에서 이벤트에 실려
+    // 오므로 판정만 돌려준다 — 동작은 이전과 완전히 같다.
+    evaluate: (e) => ({ verdict: evaluateDart(e) }),
     intervalMs: pollIntervalMs,
     countsAgainstApiBudget: true,
   }]

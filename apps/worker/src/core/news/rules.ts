@@ -1,4 +1,4 @@
-import type { NormalizedEvent, Verdict } from '@app/shared'
+import type { Evaluation, NormalizedEvent } from '@app/shared'
 import { matchCorp, type CorpIndex } from './corp-index.js'
 import { NEWS_TIERS } from './keywords.js'
 
@@ -14,10 +14,19 @@ function squash(s: string): string {
  * `description` 은 판정에만 쓰고 **반환하지도 저장하지도 않는다**
  * (스펙 §4.3, 저작권). 제목만으로는 "삼성전자, 3분기 실적 발표"가
  * 호실적인지 어닝쇼크인지 알 수 없어 정확도가 크게 떨어진다.
+ *
+ * 반환값이 Verdict 가 아니라 Evaluation 인 이유는 **매칭된 회사를 버리지 않기
+ * 위해서**다. 게이트 1에서 찾아낸 상장사를 불리언으로만 쓰고 버리면 뉴스 행의
+ * corp_name/ticker 가 전부 NULL 로 저장된다 — 그 판정은 나중에 재구성할 수 없고
+ * (기사는 사라지고 명부는 변한다), 3d 의 주가 라벨링은 ticker 없이 돌지 않으며,
+ * 운영자 다이제스트의 "룰 튜닝 후보" 목록은 전부 `미상` 으로 찍힌다.
+ *
+ * drop 이어도 함께 돌려준다. 오히려 `no-keyword-match` drop 이야말로 튜닝 후보
+ * 목록 그 자체이므로 회사명이 가장 필요한 행이다.
  */
 export function evaluateNews(
   event: NormalizedEvent, index: CorpIndex, description: string,
-): Verdict {
+): Evaluation {
   // 게이트 1 — 종목 연결. **제목에서만, 공백을 지우지 않고** 찾는다.
   //
   // 제목으로 한정하는 이유는 실측이다(기사 461건). 본문까지 보면 통과분의 절반이
@@ -32,7 +41,12 @@ export function evaluateNews(
   // 매크로 트랙(3c)이 붙기 전까지 여기서 막힌 것은 전부 drop 이지만, events 에는
   // 그대로 기록되어 3c·3d 튜닝 근거가 된다.
   const corp = matchCorp(event.title, index)
-  if (!corp) return { action: 'drop', reason: 'no-corp-match' }
+  if (!corp) return { verdict: { action: 'drop', reason: 'no-corp-match' } }
+
+  // 여기서부터는 어느 경로로 빠져나가든 매칭된 회사를 함께 들고 나간다.
+  // CorpEntry({ name, ticker })를 EventSubject 로 그대로 쓴다 — market 은 명부에
+  // 없으므로 비운다(events.market 은 nullable 이고 DART 행만 채운다).
+  const subject = { name: corp.name, ticker: corp.ticker }
 
   // 게이트 2 — 영향 키워드. 이쪽은 squash 한다. 뉴스 제목이 자유 형식이라
   // `계약 체결` 과 `계약체결` 을 같게 봐야 한다.
@@ -45,8 +59,8 @@ export function evaluateNews(
     // 제목만으로는 "3분기 실적 발표" 가 호실적인지 어닝쇼크인지 알 수 없다.
     const haystack = tier === 'critical' ? titleSq : fullSq
     const hit = words.find((w) => haystack.includes(squash(w)))
-    if (hit) return { action: 'pass', tier, rule: `keyword:${hit}` }
+    if (hit) return { verdict: { action: 'pass', tier, rule: `keyword:${hit}` }, subject }
   }
 
-  return { action: 'drop', reason: 'no-keyword-match' }
+  return { verdict: { action: 'drop', reason: 'no-keyword-match' }, subject }
 }
