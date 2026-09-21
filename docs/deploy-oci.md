@@ -223,3 +223,92 @@ CI/CD를 도입한 뒤로 추가되는 원인 두 가지는 8번 섹션 끝에 5
 있는 경우**와 **GHCR 패키지가 private로 바뀌어 무인증 pull이 실패하는 경우**다.
 둘 다 "컨테이너는 떠 있다"는 상태만 보면 정상처럼 보이므로, 알림이 며칠째 뜸하면
 컨테이너 상태보다 먼저 `Deploy` 워크플로의 최근 실행 로그부터 본다.
+
+## 10. events 백업과 복구
+
+무료 티어에는 자동 백업이 없다. 뉴스 소스가 붙으면서 `events`는 DB 가 유일본인
+데이터가 됐다(스펙 §6.4) — DART 는 API 에서 재수집할 수 있지만 뉴스는 못 하고,
+필터가 내린 `verdict`/`rule`은 어디에도 없다. `.github/workflows/backup.yml`이
+매주 월요일 KST 03:00 에 `scripts/backup-events.sh`로 `events`를 CSV 로 덤프해
+gzip 압축한 뒤 GitHub Actions 아티팩트로 90일(무료 플랜 한도) 보관한다.
+
+`outbox`는 백업 대상이 아니다 — 발송 상태는 재구성 시도가 가능한 값이고, 튜닝
+가치가 있는 것은 `events`의 `verdict`/`rule`/`raw`뿐이다.
+
+### 10.1 수동 실행
+
+일정을 기다리지 않고 즉시 백업하려면:
+
+```bash
+gh workflow run backup.yml
+gh run watch
+```
+
+성공하면 그 실행의 Artifacts 에 `events-<run_id>`가 생긴다. **워크플로가
+초록이라고 백업이 있다는 뜻은 아니다** — 실제로 받아서 행 수를 확인한다:
+
+```bash
+gh run download <run_id> -n events-<run_id>
+gunzip -c events.csv.gz | wc -l   # 1 이면 헤더뿐이고 데이터가 0건이라는 뜻
+```
+
+### 10.2 이 백업이 잡는 실패, 못 잡는 실패
+
+`scripts/backup-events.sh`는 아래를 스스로 확인해서 실패를 워크플로 실패로
+드러낸다 (`set -euo pipefail`에만 기대지 않는다 — `gzip`으로 이어지는 파이프는
+그 자체로 상류 실패를 가릴 수 있어서, `psql`/`gzip` 각각의 종료 코드를
+`PIPESTATUS`로 직접 확인한다):
+
+- **`psql` 이 실패** (연결 실패, 인증 실패, 쿼리 오류, 타임아웃) — 파이프라인의
+  두 종료 코드를 각각 확인해 잡고, 남은 부분 파일을 지운다.
+- **`psql` 자체는 러너에 없음** — 백업 job 의 `Ensure psql` 단계가 먼저 설치를
+  시도한다. GitHub 러너 이미지에 `postgresql-client`가 있다고 가정하지 않는다.
+- **결과가 헤더뿐이고 데이터 행이 0건** — `gzip -9`는 빈 입력을 넣어도 수십
+  바이트짜리 유효한 gzip 파일을 만들기 때문에, 파일이 "0바이트가 아님"은 "내용이
+  있음"을 보장하지 않는다. 압축을 풀어 헤더를 뺀 실제 행 수를 세서 0건이면
+  실패로 취급한다.
+- **gzip 스트림이 잘리거나 손상됨** (예: COPY 도중 네트워크가 끊겼는데 이미 받은
+  바이트만으로 gzip 이 조용히 유효한 파일을 닫아버리는 경우) — `gzip -t`로
+  무결성을 검사한다.
+
+**이 스크립트가 잡지 못하는 것**: 쿼리는 성공하고 행도 있지만 그 내용이 이미
+낡은 경우 — 예를 들어 `DATABASE_URL`이 옛 프로젝트를 가리키고 있거나, 워커가
+며칠째 죽어서 새 이벤트가 안 들어오고 있는데 과거 행은 여전히 존재하는 경우다.
+둘 다 워크플로 자체는 초록으로 끝난다. 받은 아티팩트의 최신 `first_seen_at`
+값이 최근인지는 사람이 가끔 눈으로 확인해야 한다.
+
+### 10.3 복구
+
+DB 자체가 날아가 새로 만든 경우 먼저 3번의 마이그레이션을 적용한 뒤:
+
+```bash
+gunzip -c events.csv.gz > events.csv
+psql "$DATABASE_URL" -c "\copy events (
+  id, source_id, external_id, occurred_at, first_seen_at,
+  title, url, corp_name, ticker, market, verdict, tier, rule, raw
+) FROM 'events.csv' WITH CSV HEADER"
+```
+
+`id`는 `bigserial`이라 값을 그대로 넣어 복원하면 시퀀스가 삽입된 최댓값을
+따라가지 않는다 — 복구 후 반드시 동기화한다:
+
+```sql
+SELECT setval(pg_get_serial_sequence('events', 'id'), (SELECT MAX(id) FROM events));
+```
+
+**`outbox`는 자동으로 재구성되지 않는다.** 워커는 기동 시 `events.external_id`
+전체를 읽어 "이미 본 것"으로 표시한다(`apps/worker/src/adapters/store/postgres.ts`,
+`runIngest`의 `seen` 집합 — `apps/worker/src/pipeline/ingest.ts`) — 복구로 되살아난
+이벤트는 이 시점부터 전부 "이미 본" 상태가 되므로, 원래 `outbox` 행이 없어진
+(=재해 당시 아직 미발송이었던) 이벤트라도 재기동만으로는 발송 큐에 다시 들어가지
+않는다. 재해 시점에 `pass` 판정인데 미발송이었던 건이 있는지는 복구 직후 아래
+질의로 직접 확인한다:
+
+```sql
+SELECT id, title, tier FROM events e
+WHERE verdict = 'pass'
+  AND NOT EXISTS (SELECT 1 FROM outbox o WHERE o.event_id = e.id)
+ORDER BY first_seen_at DESC LIMIT 50;
+```
+
+자동 재발송 경로는 없다 — 필요하면 이 목록을 보고 수동으로 알린다.
