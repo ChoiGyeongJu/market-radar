@@ -40,6 +40,13 @@ export const outbox = pgTable('outbox', {
   // 로 좁힌다. 인덱스가 없으면 outbox 전체를 순차 스캔하며, sent/dead 가 쌓일수록
   // 그 비용이 단조 증가한다 — 매 폴링 사이클에 그대로 얹힌다.
   pendingIdx: index('outbox_status_next_attempt_idx').on(t.status, t.nextAttemptAt),
+  // event_id 에는 외래키(ON DELETE no action)만 있고 인덱스가 없었다. events 에서
+  // 행을 지울 때마다 Postgres 의 참조 무결성 트리거가 이 컬럼으로 outbox 를 훑어
+  // 참조가 남았는지 확인하는데, 인덱스가 없으면 이 훑기가 순차 스캔이라 이벤트
+  // 삭제 건수 × outbox 행 수만큼(O(n·m))의 비용이 pruneOlderThan 트랜잭션 하나
+  // 안에서 발생한다 — 락을 오래 쥔 채로. digestFor 의 innerJoin 3개도 이 컬럼을
+  // 조인 키로 쓰므로 같이 덕을 본다.
+  eventIdx: index('outbox_event_id_idx').on(t.eventId),
 }))
 
 export const apiUsage = pgTable('api_usage', {

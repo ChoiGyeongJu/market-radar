@@ -1,0 +1,1 @@
+CREATE INDEX "outbox_event_id_idx" ON "outbox" USING btree ("event_id");

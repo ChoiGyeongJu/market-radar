@@ -543,14 +543,21 @@ type Bindings = { events?: EventRow; outbox?: OutboxRow }
 type PruneTables = { events: EventRow[]; outbox: OutboxRow[] }
 
 /**
- * fakeSelectChain 이 만드는 서브쿼리 표현. `tx.select(...).from(...).where(...)` 는
- * 실행되지 않고 inArray/notExists 의 인자로 그대로 전달되므로(실제 drizzle의
- * PgSelect도 await 되기 전까진 실행되지 않는다), 여기서는 나중에 evalSelect 가
- * 평가할 수 있도록 대상 테이블·조건·선택 컬럼만 들고 있으면 된다. getSQL() 은
- * isSQLWrapper 계약 — 이게 없으면 inArray/notExists 가 이 객체를 Param 으로
- * 잘못 감싸버린다.
+ * fakeSelectChain 이 만드는 서브쿼리/쿼리 표현. `tx.select(...).from(...).where(...)` 는
+ * 대개 실행되지 않고 inArray/notExists 의 인자로 그대로 전달되므로(실제 drizzle의
+ * PgSelect도 await 되기 전까진 실행되지 않는다), evalSelect 가 나중에 평가할 수
+ * 있도록 대상 테이블·조건·선택 컬럼만 들고 있으면 된다. getSQL() 은 isSQLWrapper
+ * 계약 — 이게 없으면 inArray/notExists 가 이 객체를 Param 으로 잘못 감싸버린다.
+ * then 은 선택적이다 — pinned 카운트처럼 이 select 자체가 직접 await 되는 경우에만
+ * fakeSelectChain 이 채워 넣는다.
  */
-type FakeSubquery = { __table: 'events' | 'outbox'; __where: unknown; __col: unknown; getSQL: () => unknown }
+type FakeSubquery = {
+  __table: 'events' | 'outbox'
+  __where: unknown
+  __col: unknown
+  getSQL: () => unknown
+  then?: (resolve: (v: unknown[]) => void) => void
+}
 
 function isFakeSubquery(node: unknown): node is FakeSubquery {
   return typeof node === 'object' && node !== null && '__table' in node
@@ -634,14 +641,40 @@ function evalSelect(node: unknown, outer: Bindings, tables: PruneTables): unknow
   return out
 }
 
-function fakeSelectChain(cols: Record<string, unknown>) {
+/**
+ * `tx.select(cols).from(table).where(cond)` 를 흉내낸다. 두 가지 방식으로 쓰인다:
+ *
+ * 1. inArray/notExists 의 서브쿼리 인자로 — 절대 await 되지 않고 getSQL() 계약만
+ *    요구된다(실제 drizzle의 PgSelect도 마찬가지).
+ * 2. pinned 카운트처럼 직접 await 되는 최상위 쿼리로 — 이 fake 안에서는 count(*)
+ *    집계 하나뿐이므로, then()이 호출되면 __where 에 매칭되는 행 수를 세어
+ *    `[{ <cols의 키>: n }]` 형태로 resolve 한다. 같은 객체가 getSQL() 도 갖고
+ *    있어서 두 용도 모두를 하나의 반환값으로 처리한다 — 실제 코드가 이 select 를
+ *    서브쿼리로 쓸지 직접 await 할지는 postgres.ts 쪽에서 결정하는 것이지 fake가
+ *    미리 알 필요가 없다.
+ */
+function fakeSelectChain(cols: Record<string, unknown>, snapshot: () => PruneTables) {
   return {
     from: (table: unknown) => {
       const tableName = getTableName(table as never) as 'events' | 'outbox'
       return {
         where: (cond: unknown): FakeSubquery => {
-          const col = Object.values(cols)[0]
-          return { __table: tableName, __where: cond, __col: col, getSQL: () => cond }
+          const colKey = Object.keys(cols)[0] as string
+          const col = cols[colKey]
+          return {
+            __table: tableName,
+            __where: cond,
+            __col: col,
+            getSQL: () => cond,
+            then: (resolve: (v: unknown[]) => void) => {
+              const tables = snapshot()
+              let n = 0
+              for (const row of tables[tableName]) {
+                if (evalCond(cond, { [tableName]: row } as Bindings, tables)) n += 1
+              }
+              resolve([{ [colKey]: n }])
+            },
+          }
         },
       }
     },
@@ -656,7 +689,12 @@ function fakeSelectChain(cols: Record<string, unknown>) {
  * 없으므로(이 태스크의 안전 규칙), 이 fake가 drizzle이 실제로 만든 조건 트리를
  * 인메모리 두 표(events, outbox)에 대해 직접 평가한다(evalCond). outbox 삭제가
  * 먼저 실행되고 그 결과로 outboxRows 가 갱신된 "이후" events 삭제의 notExists
- * 서브�쿼리가 평가되므로, 같은 트랜잭션 안에서의 가시성도 그대로 재현된다.
+ * 서브쿼리가 평가되므로, 같은 트랜잭션 안에서의 가시성도 그대로 재현된다.
+ *
+ * delete().where() 는 `.returning()` 을 쓰지 않는 실제 구현과 똑같이 where() 자체가
+ * 곧바로 await 대상이다 — postgres.js 의 Result(빈 배열 + count 프로퍼티)를 흉내내
+ * `Object.assign([], { count })` 를 돌려준다. `.returning()` 을 아예 노출하지 않아,
+ * 구현이 실수로 다시 그걸 호출하면 타입 에러로 즉시 드러난다.
  *
  * where()에 전달된 원본 조건도 테이블별로 기록해 둔다 — 구조 자체(어떤 컬럼을
  * 참조하는지)를 확인하는 테스트가 여전히 필요할 수 있어서다.
@@ -667,37 +705,36 @@ function fakeTxDb(fixtures: PruneTables) {
   const deletedTables: string[] = []
   const outboxWhereConditions: unknown[] = []
   const eventsWhereConditions: unknown[] = []
+  const snapshot = (): PruneTables => ({ events: eventsRows, outbox: outboxRows })
 
   const tx = {
-    select: (cols: Record<string, unknown>) => fakeSelectChain(cols),
+    select: (cols: Record<string, unknown>) => fakeSelectChain(cols, snapshot),
     delete: (table: unknown) => {
       const name = getTableName(table as never) as 'events' | 'outbox'
       deletedTables.push(name)
       return {
-        where: (cond: unknown) => {
+        where: async (cond: unknown) => {
           if (name === 'outbox') outboxWhereConditions.push(cond)
           else eventsWhereConditions.push(cond)
-          return {
-            returning: async () => {
-              const tables: PruneTables = { events: eventsRows, outbox: outboxRows }
-              if (name === 'outbox') {
-                const kept: OutboxRow[] = []
-                const removed: OutboxRow[] = []
-                for (const row of outboxRows) {
-                  ;(evalCond(cond, { outbox: row }, tables) ? removed : kept).push(row)
-                }
-                outboxRows = kept
-                return removed.map((r) => ({ id: r.id }))
-              }
-              const kept: EventRow[] = []
-              const removed: EventRow[] = []
-              for (const row of eventsRows) {
-                ;(evalCond(cond, { events: row }, tables) ? removed : kept).push(row)
-              }
-              eventsRows = kept
-              return removed.map((r) => ({ id: r.id }))
-            },
+          const tables = snapshot()
+          if (name === 'outbox') {
+            const kept: OutboxRow[] = []
+            let removedCount = 0
+            for (const row of outboxRows) {
+              if (evalCond(cond, { outbox: row }, tables)) removedCount += 1
+              else kept.push(row)
+            }
+            outboxRows = kept
+            return Object.assign([], { count: removedCount })
           }
+          const kept: EventRow[] = []
+          let removedCount = 0
+          for (const row of eventsRows) {
+            if (evalCond(cond, { events: row }, tables)) removedCount += 1
+            else kept.push(row)
+          }
+          eventsRows = kept
+          return Object.assign([], { count: removedCount })
         },
       }
     },
@@ -718,27 +755,29 @@ describe('pruneOlderThan', () => {
   const recent = new Date('2026-07-01T00:00:00Z') // cutoff보다 최근
 
   it(
-    '오래된 이벤트라도 pending 상태 outbox 행이 남아있으면 이벤트도 outbox도 지우지 않고, ' +
-      '호출은 실패하지 않는다 — 지우면 outbox.event_id 외래키(ON DELETE no action) 위반으로 ' +
-      '트랜잭션 전체가 롤백되어 보관 정책이 매번 조용히 실패하게 된다',
+    '오래된 이벤트라도 pending 상태 outbox 행이 남아있으면 그 이벤트만 지우지 않고, ' +
+      'pinned 로 드러낸다 — 지우면 outbox.event_id 외래키(ON DELETE no action) 위반으로 ' +
+      '트랜잭션 전체가 롤백되어 보관 정책이 매번 조용히 실패하게 된다. ' +
+      '이벤트가 하나뿐인 픽스처로는 상관 서브쿼리(eq(outbox.eventId, events.id))와 ' +
+      '비상관 EXISTS(그냥 "outbox가 비었나")를 구별할 수 없다 — 뮤테이션 테스트가 ' +
+      '실제로 그렇게 뚫렸다. 오래된 이벤트를 두 개 두고 pending 참조는 하나만 걸어야 ' +
+      '상관관계가 실제로 평가되는지 드러난다',
     async () => {
       const { db, remaining } = fakeTxDb({
-        events: [{ id: 1, firstSeenAt: old }],
+        events: [{ id: 1, firstSeenAt: old }, { id: 2, firstSeenAt: old }],
         outbox: [{ id: 901, eventId: 1, status: 'pending' }],
       })
 
       await expect(createPostgresStore(db).pruneOlderThan(cutoff)).resolves.toEqual({
-        events: 0,
+        events: 1,
         outbox: 0,
+        pinned: 1,
       })
-      expect(remaining()).toEqual({
-        events: [{ id: 1, firstSeenAt: old }],
-        outbox: [{ id: 901, eventId: 1, status: 'pending' }],
-      })
+      expect(remaining().events).toEqual([{ id: 1, firstSeenAt: old }])
     },
   )
 
-  it('오래된 이벤트의 outbox 행이 전부 sent/dead면 이벤트와 outbox 행 모두 지운다', async () => {
+  it('오래된 이벤트의 outbox 행이 전부 sent/dead면 이벤트와 outbox 행 모두 지우고 pinned는 0이다', async () => {
     const { db, remaining } = fakeTxDb({
       events: [{ id: 2, firstSeenAt: old }],
       outbox: [
@@ -749,11 +788,11 @@ describe('pruneOlderThan', () => {
 
     const result = await createPostgresStore(db).pruneOlderThan(cutoff)
 
-    expect(result).toEqual({ events: 1, outbox: 2 })
+    expect(result).toEqual({ events: 1, outbox: 2, pinned: 0 })
     expect(remaining()).toEqual({ events: [], outbox: [] })
   })
 
-  it('outbox 행이 아예 없는 오래된 이벤트는 지운다', async () => {
+  it('outbox 행이 아예 없는 오래된 이벤트는 지우고 pinned는 0이다', async () => {
     const { db, remaining } = fakeTxDb({
       events: [{ id: 3, firstSeenAt: old }],
       outbox: [],
@@ -761,11 +800,11 @@ describe('pruneOlderThan', () => {
 
     const result = await createPostgresStore(db).pruneOlderThan(cutoff)
 
-    expect(result).toEqual({ events: 1, outbox: 0 })
+    expect(result).toEqual({ events: 1, outbox: 0, pinned: 0 })
     expect(remaining()).toEqual({ events: [], outbox: [] })
   })
 
-  it('cutoff보다 최근인 이벤트는 outbox 상태와 무관하게 건드리지 않는다', async () => {
+  it('cutoff보다 최근인 이벤트는 outbox 상태와 무관하게 건드리지 않고 pinned에도 세지 않는다', async () => {
     const { db, remaining } = fakeTxDb({
       events: [{ id: 4, firstSeenAt: recent }],
       outbox: [{ id: 904, eventId: 4, status: 'sent' }],
@@ -773,7 +812,7 @@ describe('pruneOlderThan', () => {
 
     const result = await createPostgresStore(db).pruneOlderThan(cutoff)
 
-    expect(result).toEqual({ events: 0, outbox: 0 })
+    expect(result).toEqual({ events: 0, outbox: 0, pinned: 0 })
     expect(remaining()).toEqual({
       events: [{ id: 4, firstSeenAt: recent }],
       outbox: [{ id: 904, eventId: 4, status: 'sent' }],

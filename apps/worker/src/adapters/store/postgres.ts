@@ -263,6 +263,14 @@ export function createPostgresStore(db: Db): EventStore {
       // events 를 먼저 지우면 제약 위반으로 트랜잭션이 통째로 롤백되어 보관 정책이
       // 조용히 아무 일도 하지 않게 된다.
       return db.transaction(async (tx) => {
+        // .returning() 을 쓰지 않는다 — 한 번도 정리된 적 없는 DB라면 대상이 수십만
+        // 건일 수 있고, 그 id 전부를 배열로 힙에 올리면(두 테이블 모두, 한 트랜잭션
+        // 안에서 동시에) 256MB 컨테이너에서 OOM 으로 트랜잭션이 죽는다 — 그러면 다음
+        // 실행도 똑같이 죽는다. 대신 postgres.js 가 돌려주는 결과의 count 를 읽는다.
+        // drizzle-orm 은 returning 필드를 지정하지 않으면 이 결과를 매핑하지 않고
+        // 그대로 돌려준다(postgres-js/session.js: `!fields && !customResultMapper`
+        // 분기) — postgres.js 의 Result 는 빈 배열이지만 count 프로퍼티에 영향받은
+        // 행 수가 그대로 들어 있다.
         const ob = await tx
           .delete(outbox)
           .where(
@@ -277,7 +285,6 @@ export function createPostgresStore(db: Db): EventStore {
               ),
             ),
           )
-          .returning({ id: outbox.id })
 
         const ev = await tx
           .delete(events)
@@ -298,9 +305,17 @@ export function createPostgresStore(db: Db): EventStore {
               ),
             ),
           )
-          .returning({ id: events.id })
 
-        return { events: ev.length, outbox: ob.length }
+        // "지운 게 0건"과 "지울 대상이 없어서 0건"은 운영자에게 전혀 다른 의미다.
+        // 여기서 남은 이벤트는 정의상 cutoff 보다 오래됐는데 위 NOT EXISTS 에 걸려
+        // 살아남은 행뿐이다(방금 그 DELETE 가 지울 수 있는 건 이미 다 지웠으므로).
+        // COUNT(*) 라 전체 id를 힙에 올리지 않는다 — .returning() 을 뺀 이유와 같다.
+        const pinnedRows = await tx
+          .select({ n: sql<number>`count(*)::int` })
+          .from(events)
+          .where(lt(events.firstSeenAt, cutoff))
+
+        return { events: ev.count, outbox: ob.count, pinned: pinnedRows[0]?.n ?? 0 }
       })
     },
   }

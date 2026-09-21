@@ -41,6 +41,17 @@ describe('outbox 테이블', () => {
       expect(cols).toContainEqual(['status', 'next_attempt_at'])
     },
   )
+
+  it(
+    'event_id 인덱스를 가진다 — 외래키(ON DELETE no action)만으로는 인덱스가 생기지 않는다. ' +
+      'events 에서 행을 지울 때마다 참조 무결성 트리거가 이 컬럼으로 outbox 를 훑으므로, ' +
+      '인덱스가 없으면 pruneOlderThan 이 이벤트 삭제 건수 × outbox 행 수만큼 순차 스캔한다',
+    () => {
+      const cfg = getTableConfig(outbox)
+      const cols = cfg.indexes.map((i) => i.config.columns.map((c) => 'name' in c ? c.name : ''))
+      expect(cols).toContainEqual(['event_id'])
+    },
+  )
 })
 
 describe('api_usage 테이블', () => {

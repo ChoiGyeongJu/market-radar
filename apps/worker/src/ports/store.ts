@@ -80,6 +80,11 @@ export type EventStore = {
    * 이번 호출에서 지우지 않는다 — 그 이벤트까지 지우면 같은 외래키 위반으로
    * 트랜잭션 전체가 롤백돼 보관 정책이 매번 조용히 실패한다. 그 pending 이
    * 나중에 sent/dead 로 종결되면 다음 호출에서 이벤트까지 함께 지워진다.
+   *
+   * `pinned` 는 cutoff 보다 오래됐지만 위 이유로 이번에 지우지 못한 이벤트 수다.
+   * "지운 게 0건"과 "지울 게 없어서 0건"은 운영자에게 다른 의미이므로 따로
+   * 반환한다 — 이 값이 계속 0이 아니면 pending 이 dispatch 경로에서 아예 빠져나가지
+   * 못하고 있다는 신호이고, 침묵 속에 묻히면 그 사실을 알아챌 방법이 없다.
    */
-  pruneOlderThan(cutoff: Date): Promise<{ events: number; outbox: number }>
+  pruneOlderThan(cutoff: Date): Promise<{ events: number; outbox: number; pinned: number }>
 }
