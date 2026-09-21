@@ -73,8 +73,13 @@ export type EventStore = {
    * 사라지고, 그 사실을 알 방법도 남지 않는다. 만료된 pending 은 dispatch 가
    * expiresAt 으로 이미 정리한다.
    *
-   * outbox 를 먼저 지운다. events.id 를 참조하는 외래키가 있어 순서가 바뀌면
-   * 제약 위반으로 트랜잭션이 통째로 실패한다.
+   * outbox 를 먼저 지운다. events.id 를 참조하는 외래키(ON DELETE no action)가 있어
+   * 순서가 바뀌면 제약 위반으로 트랜잭션이 통째로 실패한다.
+   *
+   * 같은 이유로, pending 행이 하나라도 남아 참조하는 이벤트는 아무리 오래됐어도
+   * 이번 호출에서 지우지 않는다 — 그 이벤트까지 지우면 같은 외래키 위반으로
+   * 트랜잭션 전체가 롤백돼 보관 정책이 매번 조용히 실패한다. 그 pending 이
+   * 나중에 sent/dead 로 종결되면 다음 호출에서 이벤트까지 함께 지워진다.
    */
   pruneOlderThan(cutoff: Date): Promise<{ events: number; outbox: number }>
 }

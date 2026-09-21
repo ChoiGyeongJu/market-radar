@@ -1,4 +1,4 @@
-import { and, asc, desc, eq, gte, inArray, isNotNull, lt, lte, sql } from 'drizzle-orm'
+import { and, asc, desc, eq, gte, inArray, isNotNull, lt, lte, notExists, sql } from 'drizzle-orm'
 import type { PostgresJsDatabase } from 'drizzle-orm/postgres-js'
 import type { NormalizedEvent, Tier } from '@app/shared'
 import type { EventStore, PendingOutbox } from '../../ports/store.js'
@@ -281,7 +281,23 @@ export function createPostgresStore(db: Db): EventStore {
 
         const ev = await tx
           .delete(events)
-          .where(lt(events.firstSeenAt, cutoff))
+          .where(
+            and(
+              lt(events.firstSeenAt, cutoff),
+              // outbox.event_id 는 events.id 를 참조하는 외래키이고 ON DELETE no action
+              // 이다 — 위에서 sent/dead 는 이미 지웠지만, pending 행이 하나라도 남아
+              // 이 이벤트를 참조하면 이 DELETE 가 제약 위반으로 실패해 트랜잭션 전체가
+              // 롤백된다. 그러면 보관 정책이 매일 똑같이 실패하며 조용히 아무 일도
+              // 하지 않는다 — 이 기능이 막으려는 바로 그 무한 증식이 재발한다.
+              // NOT EXISTS 로 참조가 하나도 안 남은 이벤트만 지운다. NOT IN 도 같은
+              // 결과지만 서브쿼리가 NULL 을 반환하면 전체가 조용히 아무것도 안 지우는
+              // 함정이 있다 — outbox.event_id 는 notNull 이라 여기선 해당 없지만,
+              // NOT EXISTS 가 더 안전한 관용구이고 보통 플래너도 더 잘 처리한다.
+              notExists(
+                tx.select({ id: outbox.id }).from(outbox).where(eq(outbox.eventId, events.id)),
+              ),
+            ),
+          )
           .returning({ id: events.id })
 
         return { events: ev.length, outbox: ob.length }

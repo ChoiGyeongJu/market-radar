@@ -537,57 +537,247 @@ describe('lastEventKstDate — 재기동 시 lastDigestDate 복원', () => {
   })
 })
 
+type EventRow = { id: number; firstSeenAt: Date }
+type OutboxRow = { id: number; eventId: number; status: string }
+type Bindings = { events?: EventRow; outbox?: OutboxRow }
+type PruneTables = { events: EventRow[]; outbox: OutboxRow[] }
+
+/**
+ * fakeSelectChain 이 만드는 서브쿼리 표현. `tx.select(...).from(...).where(...)` 는
+ * 실행되지 않고 inArray/notExists 의 인자로 그대로 전달되므로(실제 drizzle의
+ * PgSelect도 await 되기 전까진 실행되지 않는다), 여기서는 나중에 evalSelect 가
+ * 평가할 수 있도록 대상 테이블·조건·선택 컬럼만 들고 있으면 된다. getSQL() 은
+ * isSQLWrapper 계약 — 이게 없으면 inArray/notExists 가 이 객체를 Param 으로
+ * 잘못 감싸버린다.
+ */
+type FakeSubquery = { __table: 'events' | 'outbox'; __where: unknown; __col: unknown; getSQL: () => unknown }
+
+function isFakeSubquery(node: unknown): node is FakeSubquery {
+  return typeof node === 'object' && node !== null && '__table' in node
+}
+
+function resolveScalar(node: unknown, b: Bindings): unknown {
+  if (is(node, Param)) return node.value
+  // 컬럼은 문자열 이름이 아니라 schema.ts 의 실제 객체 동일성으로 식별한다 —
+  // 이름 매핑으로 하면 평가기 자신의 버그로 잘못된 컬럼을 착각해 연결해도
+  // 타입 검사로 걸러지지 않는다.
+  if (node === events.id) return b.events?.id
+  if (node === events.firstSeenAt) return b.events?.firstSeenAt
+  if (node === outbox.id) return b.outbox?.id
+  if (node === outbox.eventId) return b.outbox?.eventId
+  if (node === outbox.status) return b.outbox?.status
+  throw new Error('fakeTxDb: 평가기가 모르는 컬럼이 조건에 쓰였다 — resolveScalar를 갱신해야 한다')
+}
+
+/**
+ * eq/lt/inArray/notExists/and 가 만든 SQL 조각을 "노드 자신의" StringChunk 텍스트로
+ * 구분한다. 자식 SQL 안의 StringChunk까지 내려가면 " = "와 " and " 같은 텍스트가
+ * 뒤섞여 노드 종류를 구분할 수 없으므로, 이 노드의 queryChunks 배열 자체의 모양과
+ * 그 안의 StringChunk만 본다 — drizzle-orm 0.45.2 sql/sql.js의 sql() 템플릿 함수가
+ * 만드는 고정된 모양(이항 연산자는 5개 청크, and/notExists는 3개 청크)에 기대는
+ * 것과 같은 방식을, 파일 상단의 sqlText()/collectStringChunkText()가 이미 쓰고 있다.
+ */
+function classify(node: SQL): 'and' | 'eq' | 'lt' | 'inArray' | 'notExists' {
+  const chunks = node.queryChunks
+  if (chunks.length === 3 && chunks[0] instanceof StringChunk) {
+    const head = chunks[0].value.join('')
+    if (head === '(') return 'and'
+    if (head.startsWith('not exists')) return 'notExists'
+  }
+  if (chunks.length === 5 && chunks[2] instanceof StringChunk) {
+    const op = chunks[2].value.join('')
+    if (op === ' = ') return 'eq'
+    if (op === ' < ') return 'lt'
+    if (op === ' in ') return 'inArray'
+  }
+  throw new Error('fakeTxDb: 평가기가 모르는 조건 형태 — classify를 갱신해야 한다')
+}
+
+function evalCond(node: unknown, b: Bindings, tables: PruneTables): boolean {
+  if (!(node instanceof SQL)) throw new Error('fakeTxDb: SQL 조건이 아니다')
+  const chunks = node.queryChunks
+  switch (classify(node)) {
+    case 'and': {
+      const joined = chunks[1]
+      if (!(joined instanceof SQL)) throw new Error('fakeTxDb: and 구조가 예상과 다르다')
+      const children = joined.queryChunks.filter((c): c is SQL => c instanceof SQL)
+      if (children.length < 2) throw new Error('fakeTxDb: and 자식이 2개 미만이다')
+      return children.every((c) => evalCond(c, b, tables))
+    }
+    case 'eq':
+      return resolveScalar(chunks[1], b) === resolveScalar(chunks[3], b)
+    case 'lt': {
+      const left = resolveScalar(chunks[1], b) as Date
+      const right = resolveScalar(chunks[3], b) as Date
+      return left.getTime() < right.getTime()
+    }
+    case 'inArray': {
+      const left = resolveScalar(chunks[1], b)
+      const right = chunks[3]
+      if (Array.isArray(right)) {
+        return right.map((p) => (is(p, Param) ? p.value : p)).includes(left)
+      }
+      return evalSelect(right, b, tables).includes(left)
+    }
+    case 'notExists':
+      return evalSelect(chunks[1], b, tables).length === 0
+  }
+}
+
+function evalSelect(node: unknown, outer: Bindings, tables: PruneTables): unknown[] {
+  if (!isFakeSubquery(node)) throw new Error('fakeTxDb: 서브쿼리 형태가 아니다')
+  const out: unknown[] = []
+  for (const row of tables[node.__table]) {
+    const b: Bindings = { ...outer, [node.__table]: row } as Bindings
+    if (evalCond(node.__where, b, tables)) out.push(resolveScalar(node.__col, b))
+  }
+  return out
+}
+
+function fakeSelectChain(cols: Record<string, unknown>) {
+  return {
+    from: (table: unknown) => {
+      const tableName = getTableName(table as never) as 'events' | 'outbox'
+      return {
+        where: (cond: unknown): FakeSubquery => {
+          const col = Object.values(cols)[0]
+          return { __table: tableName, __where: cond, __col: col, getSQL: () => cond }
+        },
+      }
+    },
+  }
+}
+
 /**
  * pruneOlderThan 의 `db.transaction(tx => ...)` 을 흉내내는 fake.
  *
- * `tx.select(...).from(...).where(cond)` 는 실행되지 않고 outbox.eventId 의
- * inArray 서브쿼리 인자로 그대로 전달될 뿐이다 — 실제 drizzle의 PgSelect도
- * await 되기 전까지는 실행되지 않으므로, SQLWrapper 계약(getSQL())만 지키면
- * 충분하다. delete().where().returning() 은 where 에 전달된 조건을 테이블별로
- * 기록하고 미리 정해둔 행을 반환한다 — 반환된 배열의 길이가 곧 삭제 건수다.
+ * 단순히 "쿼리가 나갔다"만 확인하면 pending 이벤트가 실제로 살아남는지, sent/dead
+ * 만 있는 이벤트가 실제로 지워지는지는 증명하지 못한다 — 운영 DB에는 연결할 수
+ * 없으므로(이 태스크의 안전 규칙), 이 fake가 drizzle이 실제로 만든 조건 트리를
+ * 인메모리 두 표(events, outbox)에 대해 직접 평가한다(evalCond). outbox 삭제가
+ * 먼저 실행되고 그 결과로 outboxRows 가 갱신된 "이후" events 삭제의 notExists
+ * 서브�쿼리가 평가되므로, 같은 트랜잭션 안에서의 가시성도 그대로 재현된다.
+ *
+ * where()에 전달된 원본 조건도 테이블별로 기록해 둔다 — 구조 자체(어떤 컬럼을
+ * 참조하는지)를 확인하는 테스트가 여전히 필요할 수 있어서다.
  */
-function fakeTxDb(outboxRows: { id: number }[], eventsRows: { id: number }[]) {
+function fakeTxDb(fixtures: PruneTables) {
+  let eventsRows = [...fixtures.events]
+  let outboxRows = [...fixtures.outbox]
   const deletedTables: string[] = []
   const outboxWhereConditions: unknown[] = []
   const eventsWhereConditions: unknown[] = []
 
   const tx = {
-    select: () => ({
-      from: () => ({
-        where: (cond: unknown) => ({ getSQL: () => cond }),
-      }),
-    }),
+    select: (cols: Record<string, unknown>) => fakeSelectChain(cols),
     delete: (table: unknown) => {
-      const name = getTableName(table as never)
+      const name = getTableName(table as never) as 'events' | 'outbox'
       deletedTables.push(name)
       return {
         where: (cond: unknown) => {
           if (name === 'outbox') outboxWhereConditions.push(cond)
           else eventsWhereConditions.push(cond)
           return {
-            returning: async () => (name === 'outbox' ? outboxRows : eventsRows),
+            returning: async () => {
+              const tables: PruneTables = { events: eventsRows, outbox: outboxRows }
+              if (name === 'outbox') {
+                const kept: OutboxRow[] = []
+                const removed: OutboxRow[] = []
+                for (const row of outboxRows) {
+                  ;(evalCond(cond, { outbox: row }, tables) ? removed : kept).push(row)
+                }
+                outboxRows = kept
+                return removed.map((r) => ({ id: r.id }))
+              }
+              const kept: EventRow[] = []
+              const removed: EventRow[] = []
+              for (const row of eventsRows) {
+                ;(evalCond(cond, { events: row }, tables) ? removed : kept).push(row)
+              }
+              eventsRows = kept
+              return removed.map((r) => ({ id: r.id }))
+            },
           }
         },
       }
     },
   }
   const db = { transaction: async (fn: (t: unknown) => Promise<unknown>) => fn(tx) }
-  return { db: db as unknown as Db, deletedTables, outboxWhereConditions, eventsWhereConditions }
+  return {
+    db: db as unknown as Db,
+    deletedTables,
+    outboxWhereConditions,
+    eventsWhereConditions,
+    remaining: () => ({ events: eventsRows, outbox: outboxRows }),
+  }
 }
 
 describe('pruneOlderThan', () => {
   const cutoff = new Date('2026-06-22T00:00:00Z')
+  const old = new Date('2026-01-01T00:00:00Z') // cutoff보다 오래됨
+  const recent = new Date('2026-07-01T00:00:00Z') // cutoff보다 최근
 
-  it('삭제된 events와 outbox 행 수를 반환한다', async () => {
-    const { db } = fakeTxDb(
-      [{ id: 1 }, { id: 2 }, { id: 3 }],
-      [{ id: 10 }, { id: 11 }],
-    )
-    const store = createPostgresStore(db)
+  it(
+    '오래된 이벤트라도 pending 상태 outbox 행이 남아있으면 이벤트도 outbox도 지우지 않고, ' +
+      '호출은 실패하지 않는다 — 지우면 outbox.event_id 외래키(ON DELETE no action) 위반으로 ' +
+      '트랜잭션 전체가 롤백되어 보관 정책이 매번 조용히 실패하게 된다',
+    async () => {
+      const { db, remaining } = fakeTxDb({
+        events: [{ id: 1, firstSeenAt: old }],
+        outbox: [{ id: 901, eventId: 1, status: 'pending' }],
+      })
 
-    const result = await store.pruneOlderThan(cutoff)
+      await expect(createPostgresStore(db).pruneOlderThan(cutoff)).resolves.toEqual({
+        events: 0,
+        outbox: 0,
+      })
+      expect(remaining()).toEqual({
+        events: [{ id: 1, firstSeenAt: old }],
+        outbox: [{ id: 901, eventId: 1, status: 'pending' }],
+      })
+    },
+  )
 
-    expect(result).toEqual({ events: 2, outbox: 3 })
+  it('오래된 이벤트의 outbox 행이 전부 sent/dead면 이벤트와 outbox 행 모두 지운다', async () => {
+    const { db, remaining } = fakeTxDb({
+      events: [{ id: 2, firstSeenAt: old }],
+      outbox: [
+        { id: 902, eventId: 2, status: 'sent' },
+        { id: 903, eventId: 2, status: 'dead' },
+      ],
+    })
+
+    const result = await createPostgresStore(db).pruneOlderThan(cutoff)
+
+    expect(result).toEqual({ events: 1, outbox: 2 })
+    expect(remaining()).toEqual({ events: [], outbox: [] })
+  })
+
+  it('outbox 행이 아예 없는 오래된 이벤트는 지운다', async () => {
+    const { db, remaining } = fakeTxDb({
+      events: [{ id: 3, firstSeenAt: old }],
+      outbox: [],
+    })
+
+    const result = await createPostgresStore(db).pruneOlderThan(cutoff)
+
+    expect(result).toEqual({ events: 1, outbox: 0 })
+    expect(remaining()).toEqual({ events: [], outbox: [] })
+  })
+
+  it('cutoff보다 최근인 이벤트는 outbox 상태와 무관하게 건드리지 않는다', async () => {
+    const { db, remaining } = fakeTxDb({
+      events: [{ id: 4, firstSeenAt: recent }],
+      outbox: [{ id: 904, eventId: 4, status: 'sent' }],
+    })
+
+    const result = await createPostgresStore(db).pruneOlderThan(cutoff)
+
+    expect(result).toEqual({ events: 0, outbox: 0 })
+    expect(remaining()).toEqual({
+      events: [{ id: 4, firstSeenAt: recent }],
+      outbox: [{ id: 904, eventId: 4, status: 'sent' }],
+    })
   })
 
   it(
@@ -595,7 +785,7 @@ describe('pruneOlderThan', () => {
       '외래키라, 순서가 바뀌면 제약 위반으로 트랜잭션이 통째로 롤백되어 보관 정책이 ' +
       '조용히 아무 일도 하지 않게 된다',
     async () => {
-      const { db, deletedTables } = fakeTxDb([], [])
+      const { db, deletedTables } = fakeTxDb({ events: [], outbox: [] })
       await createPostgresStore(db).pruneOlderThan(cutoff)
 
       expect(deletedTables).toEqual(['outbox', 'events'])
@@ -603,34 +793,25 @@ describe('pruneOlderThan', () => {
   )
 
   it(
-    'pending 상태의 outbox는 아무리 오래돼도 지우지 않는다 — ' +
-      '미발송 건을 지우면 알림이 조용히 사라지고 그 사실을 알 방법도 남지 않는다',
+    'outbox 삭제 조건은 status 컬럼을 sent/dead 화이트리스트로 좁히고 pending은 ' +
+      '허용 목록에 없다 — 화이트리스트 방식이라 나중에 상태값이 추가돼도(예: ' +
+      "'retrying') 실수로 삭제 대상에 끼지 않는다",
     async () => {
-      const { db, outboxWhereConditions } = fakeTxDb([], [])
+      const { db, outboxWhereConditions } = fakeTxDb({ events: [], outbox: [] })
       await createPostgresStore(db).pruneOlderThan(cutoff)
 
       const cond = outboxWhereConditions[0]
-      // status 컬럼이 실제로 이 조건에 쓰였는가.
       expect(collectColumns(cond)).toContain(outbox.status)
+      expect(collectColumns(cond)).toContain(outbox.eventId)
 
-      // sent/dead만 허용 목록에 있고 pending은 없어야 한다 — 화이트리스트 방식이라
-      // 나중에 상태값이 추가돼도(예: 'retrying') 실수로 삭제 대상에 끼지 않는다.
       const values = collectParamValues(cond)
       expect(values).toEqual(expect.arrayContaining(['sent', 'dead']))
       expect(values).not.toContain('pending')
     },
   )
 
-  it('outbox 삭제는 events.id 서브쿼리로 eventId를 좁힌다 — cutoff보다 오래된 event에 딸린 행만 대상이다', async () => {
-    const { db, outboxWhereConditions } = fakeTxDb([], [])
-    await createPostgresStore(db).pruneOlderThan(cutoff)
-
-    const cond = outboxWhereConditions[0]
-    expect(collectColumns(cond)).toContain(outbox.eventId)
-  })
-
-  it('events 삭제는 first_seen_at < cutoff 조건을 쓴다', async () => {
-    const { db, eventsWhereConditions } = fakeTxDb([], [])
+  it('events 삭제 조건은 first_seen_at < cutoff 를 쓴다', async () => {
+    const { db, eventsWhereConditions } = fakeTxDb({ events: [], outbox: [] })
     await createPostgresStore(db).pruneOlderThan(cutoff)
 
     const cond = eventsWhereConditions[0]
