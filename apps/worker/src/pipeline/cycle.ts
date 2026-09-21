@@ -13,6 +13,7 @@ import type { IngestStats, SourcePlan } from './ingest.js'
 import { runDispatch } from './dispatch.js'
 import { catchUpDigests } from './digest.js'
 import type { DigestAttempt } from './digest.js'
+import { runRetention } from './retention.js'
 
 /**
  * main.ts 는 `main().catch(...)` 를 모듈 로드 시점에 바로 실행하므로 테스트에서
@@ -58,6 +59,12 @@ export type CycleState = {
   lastDigestDate: string
   /** lastDigestDate 에 막혀 있는 날짜의 연속 실패 횟수. digest.ts 의 catchUpDigests 참고. */
   digestAttempt: DigestAttempt | null
+  /**
+   * 보관 정리(retention.ts)를 마지막으로 돌린 KST 날짜. 다이제스트와 같은 자리에서
+   * 날짜가 바뀔 때만 한 번 돈다 — 매 사이클(수 초~수십 초 간격)마다 수백만 행을
+   * 스캔하는 삭제 쿼리를 돌리면 그 비용을 감당할 이유가 없다.
+   */
+  lastPruneDate: string
   heartbeatFailures: number
   /**
    * 소스마다 따로 둔다 — externalId 는 소스 안에서만 유일하다. 공시 접수번호와
@@ -106,6 +113,7 @@ export async function runCycle(
   const kstDate = kstDateString(now)
   let lastDigestDate = state.lastDigestDate
   let digestAttempt = state.digestAttempt
+  let lastPruneDate = state.lastPruneDate
   let heartbeatFailures = state.heartbeatFailures
   // 실패 시에는 진입 상태 그대로 돌려준다 — 특히 coldStart 가 true 로 남아야
   // 기동 직후 DART 가 불통이었던 경우에도 첫 성공 사이클이 억제 사이클이 된다.
@@ -286,6 +294,11 @@ export async function runCycle(
     lastDigestDate = caughtUp.lastDigestDate
     digestAttempt = caughtUp.digestAttempt
 
+    // 보관 정리도 다이제스트와 같은 자리에서, 같은 KST 날짜 기준으로 하루 한 번만
+    // 돈다. runRetention 은 절대 던지지 않는다 — 던지면 아래 catch 로 가 서킷
+    // 브레이커가 발동하고, 디스크 정리 실패 때문에 알림 폴링이 느려지거나 멎는다.
+    lastPruneDate = await runRetention({ store: deps.store, log: deps.log }, lastPruneDate, now)
+
     sleepMs = sleepUntilSoonest(nextRunAt, now)
   } catch (err) {
     // 수집 루프에서 올라온 실패는 소스별 서킷이 이미 셌다. 여기서 또 세면 이
@@ -340,6 +353,7 @@ export async function runCycle(
     sleepMs,
     lastDigestDate,
     digestAttempt,
+    lastPruneDate,
     heartbeatFailures,
     seen,
     coldStart,

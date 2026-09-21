@@ -143,6 +143,11 @@ async function main(): Promise<void> {
     {
       lastDigestDate,
       digestAttempt: null,
+      // 오늘 날짜로 심는다 — lastDigestDate 처럼 DB 에서 복원하지 않는다. 복원할
+      // 대상이 없다: 보관 정리는 감사 기록이 아니라 디스크 정리이고, 언제 마지막
+      // 으로 돌았는지는 어디에도 남지 않는다. 오늘로 심어야 기동 직후 첫 사이클에
+      // 바로 스캔·삭제 쿼리가 돌지 않는다.
+      lastPruneDate: kstDateString(new Date()),
       heartbeatFailures: 0,
       seen,
       coldStart,

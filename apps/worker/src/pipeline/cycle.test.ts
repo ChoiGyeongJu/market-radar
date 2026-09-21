@@ -29,6 +29,10 @@ function warmState(heartbeatFailures = 0): CycleState {
   return {
     lastDigestDate: TODAY,
     digestAttempt: null,
+    // NOW 와 같은 날로 심는다 — 대부분의 사이클 테스트는 retention 을 다루지
+    // 않으므로, 여기를 과거 날짜로 두면 store mock 에 없는 pruneOlderThan 이
+    // 불려 엉뚱하게 터진다.
+    lastPruneDate: TODAY,
     heartbeatFailures,
     // seen·coldStart 는 소스별이다 — externalId 는 소스 안에서만 유일하다.
     seen: new Map([['dart', createSeenSet(['20260919000100'])]]),
@@ -293,6 +297,66 @@ describe('runCycle — 운영자 알림은 구독자 채널로 가지 않는다'
 })
 
 /**
+ * Task 10 — 보관 정리(retention.ts)를 다이제스트 따라잡기와 같은 자리에서,
+ * KST 날짜가 바뀔 때 하루 한 번만 돌린다. 가장 중요한 성질은 실패해도 사이클을
+ * 무너뜨리지 않는다는 것이다 — 던지면 서킷 브레이커가 발동해 디스크 정리 실패
+ * 때문에 실시간 알림 폴링이 느려지거나 멎는다.
+ */
+describe('runCycle — 보관 정리는 다이제스트와 같은 자리에서 하루 한 번 돈다', () => {
+  function retentionDeps(pruneOlderThan: ReturnType<typeof vi.fn>): CycleDeps {
+    const store = {
+      incrementApiUsage: async () => 1,
+      claimPending: async () => [],
+      pruneOlderThan,
+    } as unknown as EventStore
+    return {
+      plans: [dartPlan],
+      store,
+      notifier: { send: vi.fn(async () => ({ ok: true }) as const) },
+      operatorNotifier: { send: vi.fn(async () => ({ ok: true }) as const) },
+      summarizer,
+      heartbeat: { ping: vi.fn(async () => true) },
+      circuit: createCircuit(),
+      log: silentLog(),
+      dailyLimit: 20_000,
+    }
+  }
+
+  it('KST 날짜가 바뀌면 pruneOlderThan 을 한 번 부르고 lastPruneDate 를 오늘로 넘긴다', async () => {
+    const prune = vi.fn().mockResolvedValue({ events: 5, outbox: 2, pinned: 1 })
+    const deps = retentionDeps(prune)
+
+    const state = await runCycle(deps, { ...warmState(), lastPruneDate: '2026-09-18' }, NOW)
+
+    expect(prune).toHaveBeenCalledTimes(1)
+    expect(state.lastPruneDate).toBe(TODAY)
+  })
+
+  it('같은 날 두 번째 사이클에는 pruneOlderThan 을 부르지 않는다', async () => {
+    const prune = vi.fn().mockResolvedValue({ events: 0, outbox: 0, pinned: 0 })
+    const deps = retentionDeps(prune)
+
+    const state = await runCycle(deps, warmState(), NOW) // warmState 의 lastPruneDate = TODAY
+
+    expect(prune).not.toHaveBeenCalled()
+    expect(state.lastPruneDate).toBe(TODAY)
+  })
+
+  it('보관 정리가 실패해도 사이클은 정상 종료되고 서킷은 성공으로 남는다', async () => {
+    const prune = vi.fn().mockRejectedValue(new Error('deadlock'))
+    const deps = retentionDeps(prune)
+
+    const state = await runCycle(deps, { ...warmState(), lastPruneDate: '2026-09-18' }, NOW)
+
+    expect(prune).toHaveBeenCalledTimes(1)
+    // 날짜를 넘기지 않아 다음 사이클이 다시 시도한다.
+    expect(state.lastPruneDate).toBe('2026-09-18')
+    // 사이클은 실패로 던져지지 않는다 — 서킷은 그대로 성공 상태다.
+    expect(deps.circuit.consecutiveFailures()).toBe(0)
+  })
+})
+
+/**
  * 3a — 소스가 둘 이상이 된다. 주기(DART 10초 / RSS 30초~3분), 예산(DART 만 한도
  * 추적), 판정 함수가 소스마다 달라 SourcePlan 으로 묶어 넘긴다.
  */
@@ -355,6 +419,9 @@ describe('runCycle — 다중 소스', () => {
     return {
       lastDigestDate: kstDateString(MULTI_NOW),
       digestAttempt: null,
+      // MULTI_NOW 와 같은 날로 심는다 — 이 블록의 depsWith() store mock 은
+      // pruneOlderThan 을 갖고 있지 않다.
+      lastPruneDate: kstDateString(MULTI_NOW),
       heartbeatFailures: 0,
       seen: new Map(plans.map((p) => [p.source.id, createSeenSet([])])),
       coldStart: new Map(plans.map((p) => [p.source.id, false])),
