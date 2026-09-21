@@ -1,4 +1,4 @@
-import { and, asc, desc, eq, gte, isNotNull, lt, lte, sql } from 'drizzle-orm'
+import { and, asc, desc, eq, gte, inArray, isNotNull, lt, lte, notExists, sql } from 'drizzle-orm'
 import type { PostgresJsDatabase } from 'drizzle-orm/postgres-js'
 import type { NormalizedEvent, Tier } from '@app/shared'
 import type { EventStore, PendingOutbox } from '../../ports/store.js'
@@ -183,15 +183,23 @@ export function createPostgresStore(db: Db): EventStore {
       return rows[0]?.c ?? 0
     },
 
-    async digestFor(kstDate) {
+    async digestFor(kstDate, sourceId) {
       const dayStart = new Date(`${kstDate}T00:00:00+09:00`)
       const dayEnd = new Date(dayStart.getTime() + 24 * 60 * 60_000)
+
+      // 다섯 집계 전부에 같은 조건으로 건다. sourceId 를 API 사용량 분모에만
+      // 쓰면, 뉴스를 켜는 날 공시 다이제스트의 발송·dead·에러 카운트에 뉴스가
+      // 섞이고, 50줄짜리 "룰 튜닝 후보" 목록이 종목만 잡히고 키워드가 안 잡힌
+      // 뉴스로 뒤덮인다 — 그 목록이 다이제스트의 존재 이유 전부다.
+      // 뉴스 다이제스트는 3c 로 미뤄져 있다(계획서). 쿼리 층에서도 지킨다.
+      const ofSource = eq(events.sourceId, sourceId)
 
       const sentRows = await db.select({ tier: outbox.tier, n: sql<number>`count(*)::int` })
         .from(outbox)
         .innerJoin(events, eq(outbox.eventId, events.id))
         .where(and(
           eq(outbox.status, 'sent'),
+          ofSource,
           gte(events.firstSeenAt, dayStart),
           lt(events.firstSeenAt, dayEnd),
         ))
@@ -207,6 +215,7 @@ export function createPostgresStore(db: Db): EventStore {
         .innerJoin(events, eq(outbox.eventId, events.id))
         .where(and(
           eq(outbox.status, 'dead'),
+          ofSource,
           gte(events.firstSeenAt, dayStart),
           lt(events.firstSeenAt, dayEnd),
         ))
@@ -216,6 +225,7 @@ export function createPostgresStore(db: Db): EventStore {
       }).from(events).where(and(
         eq(events.verdict, 'drop'),
         eq(events.rule, 'no-keyword-match'),
+        ofSource,
         gte(events.firstSeenAt, dayStart),
         lt(events.firstSeenAt, dayEnd),
       )).limit(50)
@@ -229,6 +239,7 @@ export function createPostgresStore(db: Db): EventStore {
         .innerJoin(events, eq(outbox.eventId, events.id))
         .where(and(
           isNotNull(outbox.lastError),
+          ofSource,
           gte(events.firstSeenAt, dayStart),
           lt(events.firstSeenAt, dayEnd),
         ))
@@ -245,6 +256,7 @@ export function createPostgresStore(db: Db): EventStore {
         .from(events).where(and(
           eq(events.verdict, 'drop'),
           eq(events.rule, 'no-keyword-match'),
+          ofSource,
           gte(events.firstSeenAt, dayStart),
           lt(events.firstSeenAt, dayEnd),
         ))
@@ -256,6 +268,67 @@ export function createPostgresStore(db: Db): EventStore {
         errorCounts,
         missedTotal: missedTotalRows[0]?.n ?? 0,
       }
+    },
+
+    async pruneOlderThan(cutoff) {
+      // outbox 를 먼저 지운다 — outbox.event_id 가 events.id 를 참조하는 외래키라,
+      // events 를 먼저 지우면 제약 위반으로 트랜잭션이 통째로 롤백되어 보관 정책이
+      // 조용히 아무 일도 하지 않게 된다.
+      return db.transaction(async (tx) => {
+        // .returning() 을 쓰지 않는다 — 한 번도 정리된 적 없는 DB라면 대상이 수십만
+        // 건일 수 있고, 그 id 전부를 배열로 힙에 올리면(두 테이블 모두, 한 트랜잭션
+        // 안에서 동시에) 256MB 컨테이너에서 OOM 으로 트랜잭션이 죽는다 — 그러면 다음
+        // 실행도 똑같이 죽는다. 대신 postgres.js 가 돌려주는 결과의 count 를 읽는다.
+        // drizzle-orm 은 returning 필드를 지정하지 않으면 이 결과를 매핑하지 않고
+        // 그대로 돌려준다(postgres-js/session.js: `!fields && !customResultMapper`
+        // 분기) — postgres.js 의 Result 는 빈 배열이지만 count 프로퍼티에 영향받은
+        // 행 수가 그대로 들어 있다.
+        const ob = await tx
+          .delete(outbox)
+          .where(
+            and(
+              // pending 은 절대 포함하지 않는다 — 미발송 건을 지우면 알림이 조용히
+              // 사라지고, 그 사실을 알 방법도 남지 않는다. 만료된 pending 은 dispatch 가
+              // expiresAt 으로 이미 정리한다.
+              inArray(outbox.status, ['sent', 'dead']),
+              inArray(
+                outbox.eventId,
+                tx.select({ id: events.id }).from(events).where(lt(events.firstSeenAt, cutoff)),
+              ),
+            ),
+          )
+
+        const ev = await tx
+          .delete(events)
+          .where(
+            and(
+              lt(events.firstSeenAt, cutoff),
+              // outbox.event_id 는 events.id 를 참조하는 외래키이고 ON DELETE no action
+              // 이다 — 위에서 sent/dead 는 이미 지웠지만, pending 행이 하나라도 남아
+              // 이 이벤트를 참조하면 이 DELETE 가 제약 위반으로 실패해 트랜잭션 전체가
+              // 롤백된다. 그러면 보관 정책이 매일 똑같이 실패하며 조용히 아무 일도
+              // 하지 않는다 — 이 기능이 막으려는 바로 그 무한 증식이 재발한다.
+              // NOT EXISTS 로 참조가 하나도 안 남은 이벤트만 지운다. NOT IN 도 같은
+              // 결과지만 서브쿼리가 NULL 을 반환하면 전체가 조용히 아무것도 안 지우는
+              // 함정이 있다 — outbox.event_id 는 notNull 이라 여기선 해당 없지만,
+              // NOT EXISTS 가 더 안전한 관용구이고 보통 플래너도 더 잘 처리한다.
+              notExists(
+                tx.select({ id: outbox.id }).from(outbox).where(eq(outbox.eventId, events.id)),
+              ),
+            ),
+          )
+
+        // "지운 게 0건"과 "지울 대상이 없어서 0건"은 운영자에게 전혀 다른 의미다.
+        // 여기서 남은 이벤트는 정의상 cutoff 보다 오래됐는데 위 NOT EXISTS 에 걸려
+        // 살아남은 행뿐이다(방금 그 DELETE 가 지울 수 있는 건 이미 다 지웠으므로).
+        // COUNT(*) 라 전체 id를 힙에 올리지 않는다 — .returning() 을 뺀 이유와 같다.
+        const pinnedRows = await tx
+          .select({ n: sql<number>`count(*)::int` })
+          .from(events)
+          .where(lt(events.firstSeenAt, cutoff))
+
+        return { events: ev.count, outbox: ob.count, pinned: pinnedRows[0]?.n ?? 0 }
+      })
     },
   }
 }

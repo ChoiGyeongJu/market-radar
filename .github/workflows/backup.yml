@@ -1,0 +1,42 @@
+# events 테이블을 주간 백업한다 (스펙 §6.4). 뉴스 소스가 붙으면서 DB 가
+# 유일본인 데이터가 생겼다 — DART 는 API 에서 재수집할 수 있지만 뉴스는 못 하고,
+# 우리가 내린 verdict/rule/raw 는 어디에도 없다. 무료 티어에는 자동 백업이 없어서
+# 이 워크플로가 유일한 백업 경로다. 세부 실패 감지는 scripts/backup-events.sh 참고.
+name: Backup events
+
+on:
+  schedule:
+    - cron: '0 18 * * 0'   # 매주 월요일 KST 03:00 (= UTC 일요일 18:00)
+  # 일정을 기다리지 않고 즉시 백업하거나(예: 마이그레이션 직전) 스크립트
+  # 변경분을 검증하고 싶을 때 수동으로 돌린다.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  backup:
+    name: Backup events
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7.0.1
+
+      # ubuntu-latest 에 postgresql-client 가 있다고 가정하지 않는다. 없으면
+      # 백업이 조용히 실패하는데, 백업은 실패를 알아차리기 가장 어려운 종류의
+      # 작업이다 — "보통은 있다"가 바로 백업이 소리 없이 멈추는 방식이다.
+      - name: Ensure psql
+        run: psql --version || (sudo apt-get update && sudo apt-get install -y postgresql-client)
+
+      - name: Dump events
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: ./scripts/backup-events.sh events.csv.gz
+
+      - name: Upload dump
+        uses: actions/upload-artifact@v4.6.2
+        with:
+          name: events-${{ github.run_id }}
+          path: events.csv.gz
+          # 무료 플랜의 아티팩트 보관 한도 안에서 가장 길게 잡는다.
+          retention-days: 90

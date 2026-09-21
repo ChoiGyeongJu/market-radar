@@ -1,11 +1,34 @@
-import type { Verdict } from '@app/shared'
-import { evaluateDart } from '../core/dart/rules.js'
+import type { Evaluation, NormalizedEvent, Verdict } from '@app/shared'
 import { expiresAt } from '../core/policy.js'
 import type { SeenSet } from '../core/seen.js'
 import type { EventSource } from '../ports/source.js'
 import type { EventStore } from '../ports/store.js'
 
-export type IngestDeps = { source: EventSource; store: EventStore }
+/**
+ * 하나의 소스와 그 소스를 다루는 방법을 묶는다. 소스마다 폴링 주기·예산·판정이
+ * 다르므로 `EventSource` 만으로는 부족하다.
+ */
+export type SourcePlan = {
+  source: EventSource
+  /**
+   * 이 소스의 판정 함수. DART 는 evaluateDart, 뉴스는 evaluateNews 를 감싼 것.
+   *
+   * Verdict 가 아니라 Evaluation 을 돌려준다 — 판정 과정에서 알아낸 주체(뉴스의
+   * 상장사 매칭)를 저장까지 흘려보내기 위해서다. DART 는 주체가 이미 이벤트에
+   * 실려 오므로 `{ verdict }` 만 채우면 된다. 자세한 이유는 shared 의 Evaluation
+   * 주석 참고.
+   */
+  evaluate: (event: NormalizedEvent) => Evaluation
+  /** 이 소스를 얼마나 자주 볼 것인가. 시각별로 달라질 수 있다. */
+  intervalMs(now: Date): number
+  /**
+   * DART 처럼 일일 호출 한도가 있는 소스만 true. RSS 는 한도가 없으므로 false 이고,
+   * api_usage 를 올리지 않는다 — 올리면 DART 예산 가드가 엉뚱하게 발동한다.
+   */
+  countsAgainstApiBudget: boolean
+}
+
+export type IngestDeps = { plan: SourcePlan; store: EventStore }
 
 /**
  * 사이클을 넘어 살아남는 수집 상태. 이 두 값이 스펙 §6.4 의 "재기동 폭탄 방지"와
@@ -48,7 +71,7 @@ export type IngestResult = { stats: IngestStats; state: IngestState }
 export async function runIngest(
   deps: IngestDeps, state: IngestState, now: Date,
 ): Promise<IngestResult> {
-  const events = await deps.source.fetchLatest(now)
+  const events = await deps.plan.source.fetchLatest(now)
   const stats: IngestStats = {
     fetched: events.length, skipped: 0, recorded: 0, enqueued: 0, suppressed: 0, duplicated: 0,
   }
@@ -59,7 +82,18 @@ export async function runIngest(
       continue
     }
 
-    const verdict: Verdict = evaluateDart(event)
+    const evaluation = deps.plan.evaluate(event)
+    const verdict: Verdict = evaluation.verdict
+
+    // 판정이 주체를 알아냈으면 저장할 이벤트에 붙인다. **제자리에서 고치지
+    // 않는다** — event 는 소스가 만든 객체이고 core 판정 함수는 순수해야 하므로,
+    // 붙일 때만 복사본을 만든다. 이미 주체가 실려 온 소스(DART)는 그대로 통과한다.
+    //
+    // 이 한 줄이 없으면 recordEvent 가 corp_name/ticker 에 NULL 을 쓴다. 그 값은
+    // 나중에 복구할 수 없다 — 기사는 사라지고 상장사 명부는 계속 변한다.
+    const stored: NormalizedEvent = evaluation.subject !== undefined
+      ? { ...event, subject: evaluation.subject }
+      : event
 
     // 게이트 8 — 콜드 스타트 억제. 재기동 직후 워커는 **자신이 얼마나 오래 죽어
     // 있었는지 알 수 없다.** 처음 보는 것이 방금 들어온 1건인지 사흘치 밀린
@@ -73,7 +107,7 @@ export async function runIngest(
     // "verdict=pass 인데 outbox 행이 없는 이벤트"로 사후 식별된다.
     const enqueue = verdict.action === 'pass' && !state.coldStart
 
-    const inserted = await deps.store.recordEvent(event, verdict, {
+    const inserted = await deps.store.recordEvent(stored, verdict, {
       enqueue,
       expiresAt: verdict.action === 'pass' && enqueue ? expiresAt(verdict.tier, now) : null,
     })

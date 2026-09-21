@@ -3,14 +3,21 @@ import postgres from 'postgres'
 import pino from 'pino'
 import { kstDateString } from './core/budget.js'
 import { createCircuit } from './core/circuit.js'
-import { createSeenSet, SEEN_CAPACITY } from './core/seen.js'
+import { evaluateDart } from './core/dart/rules.js'
+import { evaluateNews } from './core/news/rules.js'
+import { buildCorpIndex } from './core/news/corp-index.js'
+import { pollIntervalMs } from './core/schedule.js'
+import { createSeenSet, SEEN_CAPACITY, type SeenSet } from './core/seen.js'
 import { loadConfig } from './config.js'
 import { createDartSource } from './adapters/sources/dart.js'
+import { createRssSource, FEEDS } from './adapters/sources/rss.js'
+import { fetchCorpEntries } from './adapters/sources/corp-code.js'
 import { createPostgresStore, type Db } from './adapters/store/postgres.js'
 import { createTelegramNotifier } from './adapters/notifier/telegram.js'
 import { noopSummarizer } from './adapters/summarizer/noop.js'
 import { createHeartbeat } from './pipeline/health.js'
 import { runLoop, createSleeper } from './pipeline/cycle.js'
+import type { SourcePlan } from './pipeline/ingest.js'
 
 const log = pino({ level: process.env.LOG_LEVEL ?? 'info' })
 
@@ -20,7 +27,17 @@ async function main(): Promise<void> {
   const sql = postgres(cfg.databaseUrl)
   const db = drizzle(sql) as unknown as Db
   const store = createPostgresStore(db)
-  const source = createDartSource({ apiKey: cfg.dartApiKey })
+  // 공시 소스는 NEWS_ENABLED 와 무관하게 항상 켜져 있다. 주기·예산·판정은
+  // 기존 동작 그대로다. 뉴스 소스는 DB 의존 기동 작업(아래) 뒤에 붙인다 —
+  // 이유는 그 지점의 주석 참고.
+  const plans: SourcePlan[] = [{
+    source: createDartSource({ apiKey: cfg.dartApiKey }),
+    // DART 는 주체(회사명·종목코드·시장)가 이미 정규화 단계에서 이벤트에 실려
+    // 오므로 판정만 돌려준다 — 동작은 이전과 완전히 같다.
+    evaluate: (e) => ({ verdict: evaluateDart(e) }),
+    intervalMs: pollIntervalMs,
+    countsAgainstApiBudget: true,
+  }]
   const notifier = createTelegramNotifier(cfg.telegram)
   // 운영자 채널이 설정되면 다이제스트와 장애 알림만 그쪽으로 뺀다. 토큰 버킷은
   // 인스턴스마다 따로인데, 텔레그램의 분당 한도가 채팅 단위라 이쪽이 맞다.
@@ -55,35 +72,103 @@ async function main(): Promise<void> {
       sleeper.wakeNow()
     })
   }
-  // 이미 본 공시 집합을 DB에서 심는다. 이게 없으면 첫 사이클이 최신 100건을 전부
-  // recordEvent 로 보내고, 그 뒤로도 매 사이클 같은 100건이 no-op 트랜잭션으로
-  // 반복된다 — 사이클이 DB 왕복 속도에 묶인다.
-  const seen = createSeenSet(await store.recentExternalIds(source.id, SEEN_CAPACITY))
+  // 이미 본 이벤트 집합을 DB에서 소스별로 심는다. 이게 없으면 첫 사이클이 최신
+  // 100건을 전부 recordEvent 로 보내고, 그 뒤로도 매 사이클 같은 100건이 no-op
+  // 트랜잭션으로 반복된다 — 사이클이 DB 왕복 속도에 묶인다.
+  // seen·coldStart 는 소스별이다 — externalId 는 소스 안에서만 유일하다. 공시
+  // 접수번호와 뉴스 guid 가 우연히 겹치면 한 집합에서는 한쪽이 다른 쪽에 가려
+  // 안 보인다.
+  const seen = new Map<string, SeenSet>()
+  for (const p of plans) {
+    seen.set(p.source.id, createSeenSet(await store.recentExternalIds(p.source.id, SEEN_CAPACITY)))
+  }
 
   // lastDigestDate 를 메모리에서만 초기화하면 KST 자정을 넘긴 재기동이 그 값을
   // 오늘로 되돌려 전날 다이제스트가 영영 발송되지 않는다 — 따라잡기 루프가
   // 통째로 무력화된다. DB 의 마지막 이벤트 날짜에서 복원한다.
   const lastDigestDate = (await store.lastEventKstDate()) ?? kstDateString(new Date())
 
+  if (cfg.newsEnabled) {
+    // 명부(수 MB)는 여기, 즉 DB 의존 기동 작업(위의 seen·lastDigestDate 조회)이
+    // 이미 성공한 뒤에만 받는다. DB 호출보다 앞에 두면 DB 장애 시 기동이 명부를
+    // 다 받은 *뒤에* 던지고, --restart always 가 매번(최대 분당 1회) 재기동시켜
+    // 장애가 지속되는 동안 계속 다시 받는다 — 이 DART 호출은 countsAgainstApiBudget
+    // 가 false 라 api_usage 에도 잡히지 않아 예산 가드가 그 낭비를 보지도 못한다.
+    //
+    // 못 받으면 기동을 중단한다 — throw 를 여기서 삼키지 않는다. 빈 명부로 돌면
+    // 모든 뉴스가 no-corp-match 로 drop 되면서 워커는 정상으로 보이고 알림만
+    // 0건이 된다 (fetchCorpEntries 주석 참고).
+    const corpIndex = buildCorpIndex(await fetchCorpEntries(cfg.dartApiKey))
+    const rss = createRssSource({
+      feeds: FEEDS,
+      // 콜백을 넘기지 않으면 죽은 피드가 흔적 없이 사라진다.
+      onFeedError: (feedId, err) => log.error({ err, feedId }, 'rss feed failed'),
+    })
+    log.info({ corps: corpIndex.byLength.length, feeds: FEEDS.length }, 'news source enabled')
+    plans.push({
+      source: rss,
+      // description 은 판정에만 쓰고 이벤트에 담지 않으므로 여기서 꺼내 넘긴다.
+      // rss.descriptionOf 는 fetchLatest 가 매 호출마다 통째로 교체하는 맵을
+      // 읽으므로, 반드시 같은 사이클 안에서(이 이벤트를 만든 fetchLatest 직후)
+      // 평가해야 한다 — 이벤트를 사이클 밖으로 들고 나가 나중에 평가하면
+      // description 이 이미 다음 fetch 로 교체되어 빈 문자열을 읽는다.
+      evaluate: (e) => evaluateNews(e, corpIndex, rss.descriptionOf(e.externalId)),
+      intervalMs: () => cfg.newsIntervalMs,
+      countsAgainstApiBudget: false,
+    })
+    // 위 seen 시딩 루프가 돌 때는 뉴스 플랜이 아직 plans 에 없었으므로 따로 심는다.
+    seen.set(rss.id, createSeenSet(await store.recentExternalIds(rss.id, SEEN_CAPACITY)))
+  }
+
+  // 첫 사이클은 기록만 하고 한 건도 발송하지 않는다. 워커는 자신이 얼마나 오래
+  // 죽어 있었는지 알 수 없으므로, 처음 보는 물량이 신규 1건인지 사흘치 밀린
+  // 것인지 구분할 방법이 없다 (스펙 §6.4). 새로 붙인 소스도 첫 사이클은 동일하다.
+  // plans 가 이 시점(뉴스 플랜을 붙였다면 그 뒤)에 확정되므로 여기서 만든다.
+  const coldStart = new Map(plans.map((p) => [p.source.id, true]))
+  const nextRunAt = new Map(plans.map((p) => [p.source.id, 0]))
+
+  // 꺼져 있다는 사실을 기동 때 한 번 남긴다. 이 줄이 없으면 운영자는 "보관 정리
+  // 로그가 안 보인다"를 만났을 때 **꺼진 것**과 **고장 난 것**을 구별할 수 없다 —
+  // 둘 다 침묵으로 보인다. 켜져 있으면 하루 한 번의 'retention pruned' 가 그
+  // 역할을 하므로 여기서 따로 알리지 않는다.
+  if (!cfg.retentionEnabled) {
+    log.info(
+      { retentionEnabled: false },
+      'retention disabled — 90일 지난 행을 지우지 않는다 (RETENTION_ENABLED=true 로 켠다)',
+    )
+  }
+
   log.info(
-    { seen: seen.size, lastDigestDate, operatorChannel: cfg.operatorChatId !== null },
+    {
+      seen: [...seen.values()].reduce((n, s) => n + s.size, 0),
+      lastDigestDate,
+      operatorChannel: cfg.operatorChatId !== null,
+      newsEnabled: cfg.newsEnabled,
+      retentionEnabled: cfg.retentionEnabled,
+    },
     'worker started',
   )
 
   await runLoop(
     {
-      source, store, notifier, operatorNotifier, summarizer, heartbeat, circuit, log,
+      plans, store, notifier, operatorNotifier, summarizer, heartbeat, circuit, log,
       dailyLimit: cfg.dartDailyLimit,
+      retentionEnabled: cfg.retentionEnabled,
     },
     {
       lastDigestDate,
       digestAttempt: null,
+      // 오늘 날짜로 심는다 — lastDigestDate 처럼 DB 에서 복원하지 않는다. 복원할
+      // 대상이 없다: 보관 정리는 감사 기록이 아니라 디스크 정리이고, 언제 마지막
+      // 으로 돌았는지는 어디에도 남지 않는다. 오늘로 심어야 기동 직후 첫 사이클에
+      // 바로 스캔·삭제 쿼리가 돌지 않는다.
+      lastPruneDate: kstDateString(new Date()),
       heartbeatFailures: 0,
       seen,
-      // 첫 사이클은 기록만 하고 한 건도 발송하지 않는다. 워커는 자신이 얼마나
-      // 오래 죽어 있었는지 알 수 없으므로, 처음 보는 물량이 신규 1건인지
-      // 사흘치 밀린 것인지 구분할 방법이 없다 (스펙 §6.4).
-      coldStart: true,
+      coldStart,
+      nextRunAt,
+      // 서킷도 소스별이다. 첫 실행 때 소스 id 를 보고 만들어 넣는다.
+      circuits: new Map(),
     },
     sleeper,
     { shouldStop: () => shuttingDown },

@@ -210,6 +210,57 @@ describe('loadConfig — 빈 값·공백은 "키 없음"과 동일하게 취급�
 // 전처리는 선택/기본값 필드에만 적용된다. 필수 필드는 여전히 엄격해야 한다 —
 // 빈 문자열이 "없음"으로 접혀 통과해 버리면 필수값 누락을 조용히 숨기게 된다.
 // --------------------------------------------------------------------------
+describe('loadConfig — NEWS_ENABLED / NEWS_INTERVAL_MS (배포와 활성화를 분리한다)', () => {
+  it('NEWS_ENABLED 기본값은 false — 배포와 활성화를 분리한다', () => {
+    expect(loadConfig(valid).newsEnabled).toBe(false)
+  })
+
+  it('NEWS_ENABLED=true면 켜진다', () => {
+    expect(loadConfig({ ...valid, NEWS_ENABLED: 'true' }).newsEnabled).toBe(true)
+  })
+
+  it('NEWS_INTERVAL_MS 기본값은 60초 — 조건부 요청이 거의 안 먹어 매번 전문을 받는다', () => {
+    expect(loadConfig(valid).newsIntervalMs).toBe(60_000)
+  })
+
+  it('빈 문자열은 기본값으로 접힌다', () => {
+    expect(loadConfig({ ...valid, NEWS_INTERVAL_MS: '' }).newsIntervalMs).toBe(60_000)
+  })
+})
+
+// --------------------------------------------------------------------------
+// RETENTION_ENABLED — 이 브랜치에서 유일하게 되돌릴 수 없는 스위치다. 90일 지난
+// events/outbox 를 영구 삭제하며, 주간 덤프 백업은 아직 한 번도 돌지 않았다.
+// 기본값이 true 로 뒤집히면 병합 24시간 안에 첫 KST 자정에 삭제가 발동한다.
+// --------------------------------------------------------------------------
+describe('loadConfig — RETENTION_ENABLED (되돌릴 수 없으므로 기본은 꺼짐)', () => {
+  it('기본값은 false — 키를 아예 주지 않아도 삭제가 켜지지 않는다', () => {
+    expect(loadConfig(valid).retentionEnabled).toBe(false)
+  })
+
+  it('RETENTION_ENABLED=true 여야만 켜진다', () => {
+    expect(loadConfig({ ...valid, RETENTION_ENABLED: 'true' }).retentionEnabled).toBe(true)
+  })
+
+  it('RETENTION_ENABLED=false 는 그대로 꺼짐이다', () => {
+    expect(loadConfig({ ...valid, RETENTION_ENABLED: 'false' }).retentionEnabled).toBe(false)
+  })
+
+  it(
+    '빈 문자열은 꺼짐으로 접힌다 — `docker run --env-file` 은 `KEY=` 를 빈 문자열로 ' +
+      '넘기고, 그게 거부되거나 기본값을 건너뛰면 런북대로 비워둔 운영자가 다친다',
+    () => {
+      expect(loadConfig({ ...valid, RETENTION_ENABLED: '' }).retentionEnabled).toBe(false)
+      expect(loadConfig({ ...valid, RETENTION_ENABLED: '   ' }).retentionEnabled).toBe(false)
+    },
+  )
+
+  it('오타(예: `1`, `yes`)는 조용히 통과시키지 않고 거부한다', () => {
+    expect(() => loadConfig({ ...valid, RETENTION_ENABLED: '1' })).toThrow()
+    expect(() => loadConfig({ ...valid, RETENTION_ENABLED: 'yes' })).toThrow()
+  })
+})
+
 describe('loadConfig — 필수 값은 빈 문자열이어도 여전히 거부한다 (전처리로 약화되지 않는다)', () => {
   it('DATABASE_URL 빈 문자열은 거부한다', () => {
     expect(() => loadConfig({ ...valid, DATABASE_URL: '' })).toThrow(/DATABASE_URL/)

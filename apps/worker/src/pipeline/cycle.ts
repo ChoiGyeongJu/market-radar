@@ -1,17 +1,19 @@
 import { budgetGuard, kstDateString } from '../core/budget.js'
-import { ALERT_THRESHOLD } from '../core/circuit.js'
+import { ALERT_THRESHOLD, createCircuit } from '../core/circuit.js'
 import type { Circuit } from '../core/circuit.js'
 import { pollIntervalMs } from '../core/schedule.js'
-import type { EventSource } from '../ports/source.js'
+import { createSeenSet } from '../core/seen.js'
+import type { SeenSet } from '../core/seen.js'
 import type { EventStore } from '../ports/store.js'
 import type { Notifier } from '../ports/notifier.js'
 import type { Summarizer } from '../ports/summarizer.js'
 import type { Heartbeat } from './health.js'
 import { runIngest } from './ingest.js'
-import type { IngestState } from './ingest.js'
+import type { IngestStats, SourcePlan } from './ingest.js'
 import { runDispatch } from './dispatch.js'
 import { catchUpDigests } from './digest.js'
 import type { DigestAttempt } from './digest.js'
+import { runRetention } from './retention.js'
 
 /**
  * main.ts 는 `main().catch(...)` 를 모듈 로드 시점에 바로 실행하므로 테스트에서
@@ -24,7 +26,11 @@ export type CycleLogger = {
 }
 
 export type CycleDeps = {
-  source: EventSource
+  /**
+   * 볼 소스들과 각각을 다루는 방법. 소스마다 폴링 주기·예산·판정이 다르므로
+   * 하나로 묶어 받는다 (ingest.ts 의 SourcePlan).
+   */
+  plans: readonly SourcePlan[]
   store: EventStore
   /** 구독자용 채널. 공시 알림만 나간다. */
   notifier: Notifier
@@ -38,20 +44,78 @@ export type CycleDeps = {
   operatorNotifier: Notifier
   summarizer: Summarizer
   heartbeat: Heartbeat
+  /**
+   * 사이클 자체의 서킷. 수집 **바깥**(발송·다이제스트)에서 터진 실패와 전면
+   * 수집 실패의 백오프를 담당한다. 소스별 건강 상태는 소스마다 따로 가진
+   * 서킷이 본다 (CycleState.circuits).
+   */
   circuit: Circuit
   log: CycleLogger
   /** 계정에 발급된 일일 한도. budgetGuard 와 다이제스트 분모에 그대로 흘러간다. */
   dailyLimit: number
+  /**
+   * 보관 정리(retention.ts)를 돌릴 것인가. 선택 필드가 아니라 **필수**로 둔다 —
+   * 되돌릴 수 없는 삭제의 스위치를 빠뜨렸을 때 기본값이 조용히 결정하게 두지
+   * 않는다. 호출자가 매번 명시적으로 답해야 한다.
+   *
+   * false 면 runRetention 을 아예 호출하지 않는다. lastPruneDate 도 그대로
+   * 둔다 — 날짜만 전진시키면 나중에 켰을 때 "오늘은 이미 돈 것"으로 보여
+   * 첫 스윕이 하루 늦는다.
+   */
+  retentionEnabled: boolean
 }
 
 export type CycleState = {
   lastDigestDate: string
   /** lastDigestDate 에 막혀 있는 날짜의 연속 실패 횟수. digest.ts 의 catchUpDigests 참고. */
   digestAttempt: DigestAttempt | null
+  /**
+   * 보관 정리(retention.ts)를 마지막으로 돌린 KST 날짜. 다이제스트와 같은 자리에서
+   * 날짜가 바뀔 때만 한 번 돈다 — 매 사이클(수 초~수십 초 간격)마다 수백만 행을
+   * 스캔하는 삭제 쿼리를 돌리면 그 비용을 감당할 이유가 없다.
+   */
+  lastPruneDate: string
   heartbeatFailures: number
-} & IngestState
+  /**
+   * 소스마다 따로 둔다 — externalId 는 소스 안에서만 유일하다. 공시 접수번호와
+   * 뉴스 guid 가 우연히 겹치면 한 집합에서는 한쪽이 다른 쪽에 가려 안 보인다.
+   */
+  seen: Map<string, SeenSet>
+  /** 소스마다 따로 둔다 — 새로 붙인 소스만 콜드 스타트일 수 있다. */
+  coldStart: Map<string, boolean>
+  /** 소스별 다음 실행 시각(ms). 주기가 서로 다르다. */
+  nextRunAt: Map<string, number>
+  /**
+   * 소스별 서킷 브레이커. 하나를 공유하면 건강한 소스의 성공이 아픈 소스의
+   * 연속 실패 카운터를 매 사이클 0 으로 되돌려, DART 가 완전히 죽어도 임계값에
+   * 닿지 못하고 운영자 알림이 영영 0건 간다. 백오프도 같은 이유로 소스별이다.
+   */
+  circuits: Map<string, Circuit>
+}
 
 export type CycleResult = CycleState & { sleepMs: number }
+
+/**
+ * 다음 사이클까지 잘 시간. **성공하든 실패하든 규칙은 하나다** — 소스별
+ * nextRunAt 중 가장 이른 것에 맞춘다.
+ *
+ * 예산 감속도 실패 백오프도 이미 각 소스의 nextRunAt 에 들어가 있다. 여기에
+ * 사이클 단위 배수를 다시 곱하면 실패한 소스는 두 번 밀리고, 멀쩡한 소스는
+ * 남의 장애 때문에 폴링이 멎는다 — DART 만 주기가 된 사이클에서 DART 가
+ * 실패하면 사이클 전체가 10분을 자고, 자기 주기가 60초인 뉴스가 그 10분 동안
+ * 한 번도 돌지 않았다(실측: 98분에 33회, 정상이면 98회).
+ *
+ * 소스가 하나뿐이면 이 값은 `plan.intervalMs(now) * 그 소스의 배수` 이므로
+ * 기존 실패 경로의 `pollIntervalMs(now) * multiplier` 와 같은 수다.
+ *
+ * 1초 하한은 주기가 0 이하로 잡힌 소스가 루프를 바쁘게 돌리는 것을 막는다.
+ * 소스가 하나도 없으면 Math.min() 이 Infinity 라 영원히 잠든다 — 폴백을 둔다.
+ */
+function sleepUntilSoonest(nextRunAt: ReadonlyMap<string, number>, now: Date): number {
+  const deltas = [...nextRunAt.values()].map((t) => t - now.getTime())
+  const soonest = deltas.length > 0 ? Math.min(...deltas) : pollIntervalMs(now)
+  return Math.max(soonest, 1_000)
+}
 
 export async function runCycle(
   deps: CycleDeps, state: CycleState, now: Date,
@@ -59,40 +123,165 @@ export async function runCycle(
   const kstDate = kstDateString(now)
   let lastDigestDate = state.lastDigestDate
   let digestAttempt = state.digestAttempt
+  let lastPruneDate = state.lastPruneDate
   let heartbeatFailures = state.heartbeatFailures
   // 실패 시에는 진입 상태 그대로 돌려준다 — 특히 coldStart 가 true 로 남아야
   // 기동 직후 DART 가 불통이었던 경우에도 첫 성공 사이클이 억제 사이클이 된다.
-  let ingestState: IngestState = { seen: state.seen, coldStart: state.coldStart }
+  // 소스별로 나뉘었으므로 수집에 성공한 소스만 각자 내려간다 — 한 소스의 장애가
+  // 다른 소스의 억제 사이클을 소모하지 않는다.
+  const seen = new Map(state.seen)
+  const coldStart = new Map(state.coldStart)
+  const nextRunAt = new Map(state.nextRunAt)
+  const circuits = new Map(state.circuits)
   let sleepMs: number
+  // 수집 전체가 실패해 던졌는가. 바깥 catch 는 이 값으로 "수집이 무너진 것"과
+  // "발송·다이제스트가 무너진 것"을 가른다 — 알림·카운터·sleep 이 모두 다르다.
+  let allSourcesFailed = false
+  // 이번 사이클에 실패한 소스들 중 가장 나쁜 연속 실패 횟수. 'cycle failed'
+  // 로그의 failures 는 "그 실패를 세고 있는 서킷의 값"이어야 한다.
+  let worstSourceFailures = 0
 
   try {
-    const used = await deps.store.incrementApiUsage(deps.source.id, kstDate)
-    const ingest = await runIngest(
-      { source: deps.source, store: deps.store }, ingestState, now,
-    )
-    ingestState = ingest.state
+    // 이번 사이클에 실제로 폴링한 소스 수와 그중 실패한 수. 주기 미달로
+    // 건너뛴 소스는 어느 쪽에도 세지 않는다 — 보지 않은 소스는 성공도 실패도 아니다.
+    let ranCount = 0
+    let failedCount = 0
+    // 첫 실패 원인. 바깥 catch 의 'cycle failed' 로그가 래퍼 에러만 남기면
+    // 근본 원인이 그 줄에서 사라지므로 cause 로 달아 보낸다.
+    let firstError: unknown = null
+    const ingested: Array<{
+      sourceId: string; stats: IngestStats; wasColdStart: boolean; seenSize: number
+      /** 이 소스의 오늘 누적 호출 수. 한도를 추적하지 않는 소스는 null. */
+      used: number | null
+    }> = []
+
+    for (const plan of deps.plans) {
+      const id = plan.source.id
+      if ((nextRunAt.get(id) ?? 0) > now.getTime()) continue
+      const baseIntervalMs = plan.intervalMs(now)
+      nextRunAt.set(id, now.getTime() + baseIntervalMs)
+      ranCount += 1
+
+      // 처음 보는 소스의 서킷은 여기서 만든다. 소스마다 따로 두는 이유는
+      // CycleState.circuits 주석 참고.
+      let circuit = circuits.get(id)
+      if (circuit === undefined) {
+        circuit = createCircuit()
+        circuits.set(id, circuit)
+      }
+
+      let sourceUsed: number | null = null
+      try {
+        // 한도가 있는 소스만 센다. RSS 를 세면 DART 예산 가드가 엉뚱하게 발동해
+        // 폴링 주기가 2~10배로 늘어진다.
+        if (plan.countsAgainstApiBudget) {
+          sourceUsed = await deps.store.incrementApiUsage(id, kstDate)
+          // 예산 가드는 **이 소스 자신의 주기**에 건다. 사이클 전체 sleepMs 에만
+          // 걸면 주기가 더 짧은 비예산 소스가 먼저 깨우는 순간 DART 가 원래
+          // 주기로 다시 떠서 가드가 사실상 무력화된다 — 한도 초과로 020 을 맞아
+          // 서비스가 통째로 멈추는 것이 최악의 실패다(core/budget.ts 주석).
+          nextRunAt.set(
+            id, now.getTime() + budgetGuard(sourceUsed, baseIntervalMs, deps.dailyLimit),
+          )
+        }
+        // 처음 보는 소스는 콜드 스타트로 친다 — 새로 붙인 소스도 첫 사이클은
+        // 기록만 하고 한 건도 발송하지 않아야 한다.
+        const wasColdStart = coldStart.get(id) ?? true
+        const ingest = await runIngest(
+          { plan, store: deps.store },
+          { seen: seen.get(id) ?? createSeenSet(), coldStart: wasColdStart },
+          now,
+        )
+        seen.set(id, ingest.state.seen)
+        coldStart.set(id, ingest.state.coldStart)
+        // 자기 서킷만 되돌린다. 남의 카운터를 건드리면 아픈 소스의 장애가
+        // 건강한 소스의 성공에 덮여 사라진다.
+        circuit.recordSuccess()
+        ingested.push({
+          sourceId: id,
+          stats: ingest.stats,
+          wasColdStart,
+          seenSize: ingest.state.seen.size,
+          used: sourceUsed,
+        })
+      } catch (err) {
+        // 한 소스의 장애가 다른 소스의 수집을 막으면 안 된다.
+        // 다른 소스가 성공해 사이클 전체는 성공으로 끝나더라도 이 줄은 반드시
+        // 남긴다. 조용한 부분 실패는 아무도 모르는 사이 한 소스의 수집이
+        // 통째로 멎는 방식이다.
+        deps.log.error({ err, sourceId: id }, 'source ingest failed')
+        failedCount += 1
+        if (firstError === null) firstError = err
+
+        circuit.recordFailure()
+        const failures = circuit.consecutiveFailures()
+        worstSourceFailures = Math.max(worstSourceFailures, failures)
+
+        // 백오프도 소스별이다. 아픈 소스의 다음 실행만 뒤로 민다 — 사이클 전체
+        // sleepMs 를 늘리면 DART 장애가 멀쩡한 뉴스 폴링까지 몇 분씩 멈춰 세우고,
+        // DART 자신도 10초가 아니라 그 몇 분 뒤에야 재시도된다.
+        nextRunAt.set(id, now.getTime() + baseIntervalMs * circuit.intervalMultiplier())
+
+        // `=== ALERT_THRESHOLD` 로 두면 안 된다: 전면 장애(DART·텔레그램 동시 불통) 시
+        // 5회째의 단 한 번뿐인 발송이 조용히 실패하고 failures 는 6,7,8... 로 올라가
+        // 다시 5가 되지 않으므로 장애 전 구간에 알림이 0건 간다.
+        if (failures >= ALERT_THRESHOLD && failures % ALERT_THRESHOLD === 0) {
+          // 어느 소스가 죽었는지 이름을 붙인다. 소스가 둘 이상이면 "워커가
+          // 실패 중"이라는 말만으로는 운영자가 무엇을 봐야 할지 알 수 없다.
+          await deps.operatorNotifier.send(
+            `⚠️ [${id}] 워커 연속 실패 ${failures}회` +
+            (heartbeatFailures > 0 ? `\n⚠️ heartbeat 미확인 ${heartbeatFailures}회 — 감시망 점검 필요` : ''),
+          ).catch(() => {})
+        }
+      }
+    }
+
+    // **이번에 폴링한 소스가 전부 실패했을 때만** 사이클 실패로 던진다.
+    //
+    // 하나라도 살아 있으면 던지면 안 된다 — 던지는 순간 아래 runDispatch 를
+    // 건너뛰어 **이미 outbox 에 들어가 발송을 기다리던 공시 알림까지 밀리고**,
+    // 서킷 브레이커가 폴링 주기를 최대 32배로 늘리며 연속 실패 알림이 운영자를
+    // 호출한다. 뉴스 피드 하나가 죽었다는 이유로 공시 알림을 멈추고 사람을
+    // 부르는 것은 명백히 과잉이다.
+    //
+    // 그렇다고 전부 삼켜서도 안 된다. 전면 장애(DART·DB 동시 불통)에도 서킷
+    // 브레이커가 돌지 않으면 연속 실패 알림이 0건 가고, 워커는 백오프 없이
+    // 죽은 API 를 계속 두드린다. 던지는 위치도 그대로여야 한다 — 수집이 전부
+    // 실패한 사이클에서 발송·다이제스트를 건너뛰는 기존 동작이다.
+    //
+    // 소스가 하나뿐인 현재 운영 구성에서는 "하나 실패 = 전부 실패"라 동작이
+    // 이전과 완전히 같다. ranCount 가 0 인 사이클(전부 주기 미달)은 실패가
+    // 아니다 — 아무것도 보지 않았을 뿐이다.
+    if (ranCount > 0 && failedCount === ranCount) {
+      allSourcesFailed = true
+      throw new Error('all polled sources failed', { cause: firstError })
+    }
+
     const dispatch = await runDispatch(
       { store: deps.store, notifier: deps.notifier, summarizer: deps.summarizer }, now,
     )
 
     deps.circuit.recordSuccess()
 
-    // 억제는 반드시 로그에 남긴다. 운영자는 실시간 대응을 하지 않으므로, 재기동 후
-    // "왜 그때 알림이 한 건도 안 왔는가"에 답할 기록이 여기밖에 없다.
-    if (state.coldStart) {
-      deps.log.info(
-        {
-          fetched: ingest.stats.fetched,
-          suppressed: ingest.stats.suppressed,
-          recorded: ingest.stats.recorded,
-          seen: ingest.state.seen.size,
-        },
-        'cold start — backlog recorded, nothing enqueued',
-      )
-    }
+    for (const r of ingested) {
+      // 억제는 반드시 로그에 남긴다. 운영자는 실시간 대응을 하지 않으므로, 재기동 후
+      // "왜 그때 알림이 한 건도 안 왔는가"에 답할 기록이 여기밖에 없다.
+      if (r.wasColdStart) {
+        deps.log.info(
+          {
+            sourceId: r.sourceId,
+            fetched: r.stats.fetched,
+            suppressed: r.stats.suppressed,
+            recorded: r.stats.recorded,
+            seen: r.seenSize,
+          },
+          'cold start — backlog recorded, nothing enqueued',
+        )
+      }
 
-    if (ingest.stats.recorded > 0 || dispatch.sent > 0) {
-      deps.log.info({ ingest: ingest.stats, dispatch, used }, 'cycle')
+      if (r.stats.recorded > 0 || dispatch.sent > 0) {
+        deps.log.info({ sourceId: r.sourceId, ingest: r.stats, dispatch, used: r.used }, 'cycle')
+      }
     }
 
     // 자정이 지나면 밀린 날짜를 하루씩 모두 보낸다. `= kstDate` 로 건너뛰면
@@ -102,7 +291,9 @@ export async function runCycle(
       {
         store: deps.store,
         notifier: deps.operatorNotifier,
-        sourceId: deps.source.id,
+        // 공시 다이제스트는 기존 그대로 DART 사용량을 분모로 쓴다. 뉴스
+        // 다이제스트는 3c 에서 따로 붙인다.
+        sourceId: 'dart',
         log: deps.log,
         dailyLimit: deps.dailyLimit,
       },
@@ -113,23 +304,57 @@ export async function runCycle(
     lastDigestDate = caughtUp.lastDigestDate
     digestAttempt = caughtUp.digestAttempt
 
-    sleepMs = budgetGuard(used, pollIntervalMs(now), deps.dailyLimit)
-  } catch (err) {
-    deps.circuit.recordFailure()
-    const failures = deps.circuit.consecutiveFailures()
-    deps.log.error({ err, failures }, 'cycle failed')
-
-    // `=== ALERT_THRESHOLD` 로 두면 안 된다: 전면 장애(DART·텔레그램 동시 불통) 시
-    // 5회째의 단 한 번뿐인 발송이 조용히 실패하고 failures 는 6,7,8... 로 올라가
-    // 다시 5가 되지 않으므로 장애 전 구간에 알림이 0건 간다.
-    if (failures >= ALERT_THRESHOLD && failures % ALERT_THRESHOLD === 0) {
-      await deps.operatorNotifier.send(
-        `⚠️ 워커 연속 실패 ${failures}회` +
-        (heartbeatFailures > 0 ? `\n⚠️ heartbeat 미확인 ${heartbeatFailures}회 — 감시망 점검 필요` : ''),
-      ).catch(() => {})
+    // 보관 정리도 다이제스트와 같은 자리에서, 같은 KST 날짜 기준으로 하루 한 번만
+    // 돈다. runRetention 은 절대 던지지 않는다 — 던지면 아래 catch 로 가 서킷
+    // 브레이커가 발동하고, 디스크 정리 실패 때문에 알림 폴링이 느려지거나 멎는다.
+    //
+    // RETENTION_ENABLED 가 꺼져 있으면 호출 자체를 하지 않는다. 안에서 걸러도
+    // 결과는 같지만, 되돌릴 수 없는 삭제 경로는 진입조차 하지 않는 편이 낫다 —
+    // pruneOlderThan 이 불린 적이 없다는 사실 자체가 검증 가능한 성질이 된다.
+    if (deps.retentionEnabled) {
+      lastPruneDate = await runRetention({ store: deps.store, log: deps.log }, lastPruneDate, now)
     }
 
-    sleepMs = pollIntervalMs(new Date()) * deps.circuit.intervalMultiplier()
+    sleepMs = sleepUntilSoonest(nextRunAt, now)
+  } catch (err) {
+    // 수집 루프에서 올라온 실패는 소스별 서킷이 이미 셌다. 여기서 또 세면 이
+    // 카운터가 "수집 바깥의 연속 실패"도 "사이클 실패"도 아닌 잡탕이 되고,
+    // 아래 알림이 말하는 N 이 부풀려진다 — 알림 문구와 카운터의 뜻을 맞춘다.
+    if (!allSourcesFailed) deps.circuit.recordFailure()
+    // 로그의 failures 도 그 실패를 센 서킷의 값이어야 한다. 수집 전면 실패에
+    // 사이클 서킷 값(0)을 실으면 "실패했는데 연속 실패 0"이 찍혀 오해를 부른다.
+    const failures = allSourcesFailed ? worstSourceFailures : deps.circuit.consecutiveFailures()
+    deps.log.error({ err, failures }, 'cycle failed')
+
+    // 수집 실패는 소스별 알림이 이미 담당했다. 여기서 또 보내면 전면 장애 때
+    // 같은 사이클에 두 번 울린다 — 이 알림은 수집 바깥(발송·다이제스트)에서
+    // 터진 실패만 맡는다.
+    if (!allSourcesFailed) {
+      // `=== ALERT_THRESHOLD` 로 두면 안 된다: 전면 장애(DART·텔레그램 동시 불통) 시
+      // 5회째의 단 한 번뿐인 발송이 조용히 실패하고 failures 는 6,7,8... 로 올라가
+      // 다시 5가 되지 않으므로 장애 전 구간에 알림이 0건 간다.
+      if (failures >= ALERT_THRESHOLD && failures % ALERT_THRESHOLD === 0) {
+        await deps.operatorNotifier.send(
+          `⚠️ 워커 연속 실패 ${failures}회` +
+          (heartbeatFailures > 0 ? `\n⚠️ heartbeat 미확인 ${heartbeatFailures}회 — 감시망 점검 필요` : ''),
+        ).catch(() => {})
+      }
+    }
+
+    // 무엇이 던졌느냐에 따라 물러서는 주체가 다르다.
+    if (allSourcesFailed) {
+      // 수집이 무너진 것이면 escalation 은 이미 소스별 nextRunAt 에 들어 있다.
+      // 사이클 배수를 또 곱하면 실패한 소스는 두 번 밀리고, 멀쩡한 소스는 남의
+      // 장애 때문에 폴링이 멎는다.
+      sleepMs = sleepUntilSoonest(nextRunAt, now)
+    } else {
+      // 발송·다이제스트가 던진 것이면 사이클 단위 문제(대개 DB)다. 소스별
+      // nextRunAt 은 이 실패를 전혀 담고 있지 않으므로 여기서 물러서지 않으면
+      // 장중 10초마다 이미 힘든 DB 를 그대로 다시 두드린다.
+      // 벽시계가 아니라 인자로 받은 now 를 쓴다 — 주말에 재기동된 워커가 평일
+      // 장중에도 주말 주기로 자는 일을 막는다.
+      sleepMs = pollIntervalMs(now) * deps.circuit.intervalMultiplier()
+    }
   } finally {
     // heartbeat 은 반드시 finally 에 둔다. "프로세스가 살아 루프를 돌고 있는가"에
     // 답하는 신호이고, 그 답은 DART 성공 여부와 무관하기 때문이다.
@@ -144,9 +369,12 @@ export async function runCycle(
     sleepMs,
     lastDigestDate,
     digestAttempt,
+    lastPruneDate,
     heartbeatFailures,
-    seen: ingestState.seen,
-    coldStart: ingestState.coldStart,
+    seen,
+    coldStart,
+    nextRunAt,
+    circuits,
   }
 }
 

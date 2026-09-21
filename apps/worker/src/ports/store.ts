@@ -55,8 +55,17 @@ export type EventStore = {
   incrementApiUsage(sourceId: string, kstDate: string): Promise<number>
   getApiUsage(sourceId: string, kstDate: string): Promise<number>
 
-  /** 일일 다이제스트용 집계. kstDate는 YYYY-MM-DD. */
-  digestFor(kstDate: string): Promise<{
+  /**
+   * 일일 다이제스트용 집계. kstDate는 YYYY-MM-DD.
+   *
+   * `sourceId` 는 **모든 집계에 걸리는 조건**이다. API 사용량 분모에만 쓰던 값이
+   * 아니다 — 소스 조건이 없으면 뉴스를 켜는 날 공시 다이제스트의 발송·dead·에러
+   * 카운트에 뉴스가 섞여 들어오고, 무엇보다 50줄짜리 "룰 튜닝 후보" 목록(=
+   * no-keyword-match drop)이 종목만 잡히고 키워드가 안 잡힌 뉴스로 뒤덮인다.
+   * 그 목록이 다이제스트의 존재 이유 전부다. 뉴스 다이제스트는 3c 로 미뤄져
+   * 있으므로(계획서), 쿼리 층에서도 그 분리를 지켜야 한다.
+   */
+  digestFor(kstDate: string, sourceId: string): Promise<{
     sent: { critical: number; high: number; normal: number }
     dead: number
     missedCandidates: Array<{ title: string; corpName: string | null; ticker: string | null }>
@@ -65,4 +74,26 @@ export type EventStore = {
     /** 잘리지 않은 미매칭 총계. missedCandidates 는 상위 N건만 담으므로 이 값과 다를 수 있다. */
     missedTotal: number
   }>
+
+  /**
+   * `cutoff` 보다 오래된 events 와, 그에 딸린 **종결된**(sent/dead) outbox 행을 지운다.
+   *
+   * pending 은 아무리 오래돼도 지우지 않는다 — 미발송 건을 지우면 알림이 조용히
+   * 사라지고, 그 사실을 알 방법도 남지 않는다. 만료된 pending 은 dispatch 가
+   * expiresAt 으로 이미 정리한다.
+   *
+   * outbox 를 먼저 지운다. events.id 를 참조하는 외래키(ON DELETE no action)가 있어
+   * 순서가 바뀌면 제약 위반으로 트랜잭션이 통째로 실패한다.
+   *
+   * 같은 이유로, pending 행이 하나라도 남아 참조하는 이벤트는 아무리 오래됐어도
+   * 이번 호출에서 지우지 않는다 — 그 이벤트까지 지우면 같은 외래키 위반으로
+   * 트랜잭션 전체가 롤백돼 보관 정책이 매번 조용히 실패한다. 그 pending 이
+   * 나중에 sent/dead 로 종결되면 다음 호출에서 이벤트까지 함께 지워진다.
+   *
+   * `pinned` 는 cutoff 보다 오래됐지만 위 이유로 이번에 지우지 못한 이벤트 수다.
+   * "지운 게 0건"과 "지울 게 없어서 0건"은 운영자에게 다른 의미이므로 따로
+   * 반환한다 — 이 값이 계속 0이 아니면 pending 이 dispatch 경로에서 아예 빠져나가지
+   * 못하고 있다는 신호이고, 침묵 속에 묻히면 그 사실을 알아챌 방법이 없다.
+   */
+  pruneOlderThan(cutoff: Date): Promise<{ events: number; outbox: number; pinned: number }>
 }
