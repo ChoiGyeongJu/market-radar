@@ -32,7 +32,9 @@ export type CatchUpResult = {
 
 /** 발송에 성공했는지 반환한다. 결과를 버리면 실패를 알 방법이 없다. */
 export async function runDigest(deps: DigestDeps, kstDate: string): Promise<boolean> {
-  const agg = await deps.store.digestFor(kstDate)
+  // sourceId 는 집계 전체에 걸린다. 분모(API 사용량)에만 쓰면 뉴스를 켜는 날
+  // 공시 다이제스트가 뉴스 통계까지 함께 세게 된다 — ports/store.ts 주석 참고.
+  const agg = await deps.store.digestFor(kstDate, deps.sourceId)
   const apiCalls = await deps.store.getApiUsage(deps.sourceId, kstDate)
 
   const res = await deps.notifier.send(formatDigest({

@@ -55,8 +55,17 @@ export type EventStore = {
   incrementApiUsage(sourceId: string, kstDate: string): Promise<number>
   getApiUsage(sourceId: string, kstDate: string): Promise<number>
 
-  /** 일일 다이제스트용 집계. kstDate는 YYYY-MM-DD. */
-  digestFor(kstDate: string): Promise<{
+  /**
+   * 일일 다이제스트용 집계. kstDate는 YYYY-MM-DD.
+   *
+   * `sourceId` 는 **모든 집계에 걸리는 조건**이다. API 사용량 분모에만 쓰던 값이
+   * 아니다 — 소스 조건이 없으면 뉴스를 켜는 날 공시 다이제스트의 발송·dead·에러
+   * 카운트에 뉴스가 섞여 들어오고, 무엇보다 50줄짜리 "룰 튜닝 후보" 목록(=
+   * no-keyword-match drop)이 종목만 잡히고 키워드가 안 잡힌 뉴스로 뒤덮인다.
+   * 그 목록이 다이제스트의 존재 이유 전부다. 뉴스 다이제스트는 3c 로 미뤄져
+   * 있으므로(계획서), 쿼리 층에서도 그 분리를 지켜야 한다.
+   */
+  digestFor(kstDate: string, sourceId: string): Promise<{
     sent: { critical: number; high: number; normal: number }
     dead: number
     missedCandidates: Array<{ title: string; corpName: string | null; ticker: string | null }>

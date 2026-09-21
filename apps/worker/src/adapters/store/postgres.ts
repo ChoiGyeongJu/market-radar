@@ -183,15 +183,23 @@ export function createPostgresStore(db: Db): EventStore {
       return rows[0]?.c ?? 0
     },
 
-    async digestFor(kstDate) {
+    async digestFor(kstDate, sourceId) {
       const dayStart = new Date(`${kstDate}T00:00:00+09:00`)
       const dayEnd = new Date(dayStart.getTime() + 24 * 60 * 60_000)
+
+      // 다섯 집계 전부에 같은 조건으로 건다. sourceId 를 API 사용량 분모에만
+      // 쓰면, 뉴스를 켜는 날 공시 다이제스트의 발송·dead·에러 카운트에 뉴스가
+      // 섞이고, 50줄짜리 "룰 튜닝 후보" 목록이 종목만 잡히고 키워드가 안 잡힌
+      // 뉴스로 뒤덮인다 — 그 목록이 다이제스트의 존재 이유 전부다.
+      // 뉴스 다이제스트는 3c 로 미뤄져 있다(계획서). 쿼리 층에서도 지킨다.
+      const ofSource = eq(events.sourceId, sourceId)
 
       const sentRows = await db.select({ tier: outbox.tier, n: sql<number>`count(*)::int` })
         .from(outbox)
         .innerJoin(events, eq(outbox.eventId, events.id))
         .where(and(
           eq(outbox.status, 'sent'),
+          ofSource,
           gte(events.firstSeenAt, dayStart),
           lt(events.firstSeenAt, dayEnd),
         ))
@@ -207,6 +215,7 @@ export function createPostgresStore(db: Db): EventStore {
         .innerJoin(events, eq(outbox.eventId, events.id))
         .where(and(
           eq(outbox.status, 'dead'),
+          ofSource,
           gte(events.firstSeenAt, dayStart),
           lt(events.firstSeenAt, dayEnd),
         ))
@@ -216,6 +225,7 @@ export function createPostgresStore(db: Db): EventStore {
       }).from(events).where(and(
         eq(events.verdict, 'drop'),
         eq(events.rule, 'no-keyword-match'),
+        ofSource,
         gte(events.firstSeenAt, dayStart),
         lt(events.firstSeenAt, dayEnd),
       )).limit(50)
@@ -229,6 +239,7 @@ export function createPostgresStore(db: Db): EventStore {
         .innerJoin(events, eq(outbox.eventId, events.id))
         .where(and(
           isNotNull(outbox.lastError),
+          ofSource,
           gte(events.firstSeenAt, dayStart),
           lt(events.firstSeenAt, dayEnd),
         ))
@@ -245,6 +256,7 @@ export function createPostgresStore(db: Db): EventStore {
         .from(events).where(and(
           eq(events.verdict, 'drop'),
           eq(events.rule, 'no-keyword-match'),
+          ofSource,
           gte(events.firstSeenAt, dayStart),
           lt(events.firstSeenAt, dayEnd),
         ))

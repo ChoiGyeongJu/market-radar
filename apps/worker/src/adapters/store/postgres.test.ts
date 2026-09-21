@@ -383,7 +383,7 @@ describe('digestFor', () => {
       const { db, whereCalls } = fakeDigestDb([[], [], [], [], []])
       const store = createPostgresStore(db)
 
-      await store.digestFor('2026-09-19')
+      await store.digestFor('2026-09-19', 'dart')
 
       const missedWhere = whereCalls[2]
 
@@ -401,6 +401,36 @@ describe('digestFor', () => {
     },
   )
 
+  it(
+    '다섯 집계 전부에 소스 조건이 걸린다 — 분모(API 사용량)에만 걸면 뉴스를 켜는 날 ' +
+      '공시 다이제스트의 발송·dead·에러 카운트에 뉴스가 섞이고, 50줄짜리 "룰 튜닝 후보" ' +
+      '목록이 종목만 잡힌 뉴스로 뒤덮인다. 순서: 0=sent, 1=dead, 2=missed, 3=errors, 4=missedTotal.',
+    async () => {
+      const { db, whereCalls } = fakeDigestDb([[], [], [], [], []])
+      const store = createPostgresStore(db)
+
+      await store.digestFor('2026-09-19', 'dart')
+
+      expect(whereCalls).toHaveLength(5)
+      whereCalls.forEach((where, i) => {
+        expect(collectParamValues(where), `${i}번째 집계에 소스 조건이 없다`).toContain('dart')
+      })
+    },
+  )
+
+  it('소스 이름은 하드코딩이 아니라 인자로 흐른다 — 3c 의 뉴스 다이제스트가 같은 쿼리를 쓴다', async () => {
+    const { db, whereCalls } = fakeDigestDb([[], [], [], [], []])
+    const store = createPostgresStore(db)
+
+    await store.digestFor('2026-09-19', 'news')
+
+    whereCalls.forEach((where, i) => {
+      const values = collectParamValues(where)
+      expect(values, `${i}번째 집계`).toContain('news')
+      expect(values, `${i}번째 집계`).not.toContain('dart')
+    })
+  })
+
   it('outbox.lastError를 집계해 errorCounts로 반환한다 — null인 lastError는 제외한다', async () => {
     const { db } = fakeDigestDb([
       [], // sent
@@ -415,7 +445,7 @@ describe('digestFor', () => {
     ])
     const store = createPostgresStore(db)
 
-    const result = await store.digestFor('2026-09-19')
+    const result = await store.digestFor('2026-09-19', 'dart')
 
     expect(result.errorCounts).toEqual({ 'dart-timeout': 3, 'telegram-429': 1 })
   })
@@ -430,7 +460,7 @@ describe('digestFor', () => {
     ])
     const store = createPostgresStore(db)
 
-    const result = await store.digestFor('2026-09-19')
+    const result = await store.digestFor('2026-09-19', 'dart')
 
     expect(result.missedCandidates).toHaveLength(50)
     expect(result.missedTotal).toBe(300)

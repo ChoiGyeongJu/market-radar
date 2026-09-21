@@ -31,7 +31,8 @@ describe('catchUpDigests — 장애가 자정을 두 번 넘겨도 중간 날을
     expect(next.lastDigestDate).toBe('2026-09-19')
     expect(next.digestAttempt).toBeNull()
     expect(digestFor).toHaveBeenCalledTimes(1)
-    expect(digestFor).toHaveBeenCalledWith('2026-09-18')
+    // 날짜뿐 아니라 소스도 넘겨야 한다 — 집계 전체가 이 조건으로 걸린다.
+    expect(digestFor).toHaveBeenCalledWith('2026-09-18', 'dart')
   })
 
   it('lastDigestDate 가 이틀 뒤처지면 두 번의 runDigest 호출을 날짜 순서대로 보낸다', async () => {
