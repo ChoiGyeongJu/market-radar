@@ -23,7 +23,13 @@ export async function runRetention(
   deps: RetentionDeps, lastPruneDate: string, now: Date,
 ): Promise<string> {
   const today = kstDateString(now)
-  if (today === lastPruneDate) return lastPruneDate
+  // `===` 로 두면 안 된다: 시계 스큐나 오래된 상태로 재시작해 lastPruneDate 가
+  // 현재보다 앞서 있으면(예: NTP 보정이 시계를 KST 자정 너머로 되돌리는 경우)
+  // 조건이 영원히 거짓이 되지 않아 사이클마다 전체 스윕을 반복한다 — 하루 한 번만
+  // 돌게 하려고 이 가드를 두는 것 자체가 무의미해진다(digest.ts 의 catchUpDigests
+  // 와 같은 이유). ISO 날짜 문자열은 사전순 비교가 날짜 순서와 일치하므로 `>=` 로
+  // 비교하면 lastPruneDate 가 같거나 앞선 경우 모두 즉시 종료된다.
+  if (lastPruneDate >= today) return lastPruneDate
 
   try {
     const cutoff = retentionCutoff(now)
