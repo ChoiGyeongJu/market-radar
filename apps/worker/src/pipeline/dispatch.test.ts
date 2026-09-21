@@ -388,3 +388,77 @@ describe('runDispatch — 뉴스 라우팅 (소스별 포맷·순서·병합 임
     },
   )
 })
+
+
+/**
+ * 배치가 비거나 한 건만 담긴 채로 병합 메시지를 보내지 않는다.
+ *
+ * 첫 항목 하나만으로 MAX_MERGED_CHARS 를 넘으면 담기 루프가 즉시 break 해 배치가
+ * 빈 채로 남는데, 예전 코드는 그 빈 배치를 그대로 포맷해 보냈다 — 항목이 하나도
+ * 없는 `공시 0건` / `뉴스 0건` 이 나가고, 어떤 항목도 store 호출을 받지 못해
+ * 아무것도 빠져나가지 못한 채 TTL 이 끝날 때까지 매 사이클 같은 일이 반복되며
+ * 공유 텔레그램 레이트리밋 예산을 진짜 알림에게서 빼앗는다.
+ */
+describe('runDispatch — 빈/한 건 병합 배치는 낱개 발송으로 내린다', () => {
+  /** formatMerged 한 건만으로 상한(3,500)을 넘기는 제목 길이. */
+  const HUGE = 'A'.repeat(3_600)
+  /** 한 건은 들어가지만 두 건은 상한을 넘기는 길이 — 비대칭 분할을 만든다. */
+  const WIDE = 'B'.repeat(2_000)
+
+  it('첫 항목 하나로 상한을 넘겨도 `공시 0건` 을 보내지 않고 낱개로 내보낸다', async () => {
+    const send = vi.fn<Notifier['send']>(async () => ({ ok: true as const }))
+    const items = [1, 2, 3].map((id) =>
+      pending({ id, tier: 'high', event: { ...event, title: HUGE } }),
+    )
+    // 전제 확인: 병합 임계는 넘겼고, 한 건만으로도 상한을 넘는다.
+    expect(items.length).toBeGreaterThanOrEqual(MERGE_THRESHOLD)
+    expect(formatMerged([{ event: items[0]!.event, tier: 'high' }]).length)
+      .toBeGreaterThan(MAX_MERGED_CHARS)
+
+    const { deps: d, markSent } = deps(items, send)
+    const stats = await runDispatch(d, NOW)
+
+    for (const call of send.mock.calls) expect(String(call[0])).not.toContain('공시 0건')
+    // 낱개로 세 건 모두 나가고 store 가 실제로 비워진다 — 예전 코드는 한 건도
+    // 빠져나가지 못해 다음 사이클에 같은 빈 메시지를 또 보냈다.
+    expect(send).toHaveBeenCalledTimes(3)
+    expect(markSent).toHaveBeenCalledTimes(3)
+    expect(stats.sent).toBe(3)
+  })
+
+  it('뉴스 쪽도 같다 — `뉴스 0건` 을 보내지 않는다', async () => {
+    const send = vi.fn<Notifier['send']>(async () => ({ ok: true as const }))
+    const items = [1, 2, 3].map((id) =>
+      newsPending({ id, tier: 'high', event: { ...newsEvent, title: HUGE } }),
+    )
+    const { deps: d, markSent } = deps(items, send)
+
+    const stats = await runDispatch(d, NOW)
+
+    for (const call of send.mock.calls) expect(String(call[0])).not.toContain('뉴스 0건')
+    expect(send).toHaveBeenCalledTimes(3)
+    expect(markSent).toHaveBeenCalledTimes(3)
+    expect(stats.sent).toBe(3)
+  })
+
+  it('한 건만 담기는 비대칭 분할이면 `공시 1건` 병합이 아니라 낱개 알림으로 나간다', async () => {
+    const send = vi.fn<Notifier['send']>(async () => ({ ok: true as const }))
+    const wideEvent = { ...event, title: WIDE }
+    // 전제 확인: 한 건은 상한 안, 두 건은 상한 밖 — 배치에 딱 한 건만 담긴다.
+    expect(formatMerged([{ event: wideEvent, tier: 'high' as const }]).length)
+      .toBeLessThanOrEqual(MAX_MERGED_CHARS)
+    expect(formatMerged([
+      { event: wideEvent, tier: 'high' as const },
+      { event: wideEvent, tier: 'high' as const },
+    ]).length).toBeGreaterThan(MAX_MERGED_CHARS)
+
+    const items = [1, 2, 3].map((id) => pending({ id, tier: 'high', event: wideEvent }))
+    const { deps: d, markSent } = deps(items, send)
+
+    await runDispatch(d, NOW)
+
+    for (const call of send.mock.calls) expect(String(call[0])).not.toContain('공시 1건')
+    expect(send).toHaveBeenCalledTimes(3)
+    expect(markSent).toHaveBeenCalledTimes(3)
+  })
+})

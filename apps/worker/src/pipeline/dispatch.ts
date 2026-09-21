@@ -79,16 +79,33 @@ export async function runDispatch(deps: DispatchDeps, now: Date): Promise<Dispat
     [newsOthers, formatNewsMerged] as const,
   ]) {
     if (group.length === 0) continue
+
+    // MAX_MERGED_CHARS를 넘기 전까지만 배치에 담는다 — 텔레그램 4096자 한도를 넘기면
+    // 배치 전체가 거부되어 안의 항목이 모두 같이 죽는다. 담기지 못한 항목은 아무 store
+    // 호출도 받지 않고 pending으로 남아 다음 사이클에 다시 claim된다 — 유실되지 않는다.
+    const batch: PendingOutbox[] = []
     if (merge) {
-      // MAX_MERGED_CHARS를 넘기 전까지만 배치에 담는다 — 텔레그램 4096자 한도를 넘기면
-      // 배치 전체가 거부되어 안의 항목이 모두 같이 죽는다. 담기지 못한 항목은 아무 store
-      // 호출도 받지 않고 pending으로 남아 다음 사이클에 다시 claim된다 — 유실되지 않는다.
-      const batch: PendingOutbox[] = []
       for (const item of group) {
         const next = [...batch, item]
         if (fmt(next.map((i) => ({ event: i.event, tier: i.tier }))).length > MAX_MERGED_CHARS) break
         batch.push(item)
       }
+    }
+
+    // `batch.length > 1` 이어야 병합한다. 두 가지를 동시에 막는다.
+    //
+    // 0건 — 첫 항목 **하나만으로** 상한을 넘으면 위 루프가 즉시 break 해 배치가
+    // 빈 채로 남는다. 그대로 보내면 항목이 하나도 없는 `📢 공시 0건` / `📰 뉴스
+    // 0건` 이 나간다. 게다가 어떤 항목도 store 호출을 받지 못해 아무것도 빠져
+    // 나가지 못하고, 같은 일이 매 사이클 반복되며 TTL 이 끝날 때까지 공유
+    // 텔레그램 레이트리밋 예산을 진짜 알림에게서 빼앗는다.
+    //
+    // 1건 — 비대칭 분할로 한 건만 담긴 경우다. `공시 1건` 이라는 머리글이 붙은
+    // 병합 메시지가 되는데, 그건 낱개 알림이어야 한다.
+    //
+    // 어느 쪽이든 그룹 전체를 낱개 발송으로 내린다 — 병합이 성립하지 않는
+    // 상황이므로 병합 아닌 경로의 동작과 같아지는 것이 맞다.
+    if (merge && batch.length > 1) {
       const text = fmt(batch.map((i) => ({ event: i.event, tier: i.tier })))
       const res = await deps.notifier.send(text)
       for (const item of batch) await applyResult(deps, item, res, now, stats)
