@@ -1,4 +1,4 @@
-import { and, asc, desc, eq, gte, isNotNull, lt, lte, sql } from 'drizzle-orm'
+import { and, asc, desc, eq, gte, inArray, isNotNull, lt, lte, sql } from 'drizzle-orm'
 import type { PostgresJsDatabase } from 'drizzle-orm/postgres-js'
 import type { NormalizedEvent, Tier } from '@app/shared'
 import type { EventStore, PendingOutbox } from '../../ports/store.js'
@@ -256,6 +256,36 @@ export function createPostgresStore(db: Db): EventStore {
         errorCounts,
         missedTotal: missedTotalRows[0]?.n ?? 0,
       }
+    },
+
+    async pruneOlderThan(cutoff) {
+      // outbox 를 먼저 지운다 — outbox.event_id 가 events.id 를 참조하는 외래키라,
+      // events 를 먼저 지우면 제약 위반으로 트랜잭션이 통째로 롤백되어 보관 정책이
+      // 조용히 아무 일도 하지 않게 된다.
+      return db.transaction(async (tx) => {
+        const ob = await tx
+          .delete(outbox)
+          .where(
+            and(
+              // pending 은 절대 포함하지 않는다 — 미발송 건을 지우면 알림이 조용히
+              // 사라지고, 그 사실을 알 방법도 남지 않는다. 만료된 pending 은 dispatch 가
+              // expiresAt 으로 이미 정리한다.
+              inArray(outbox.status, ['sent', 'dead']),
+              inArray(
+                outbox.eventId,
+                tx.select({ id: events.id }).from(events).where(lt(events.firstSeenAt, cutoff)),
+              ),
+            ),
+          )
+          .returning({ id: outbox.id })
+
+        const ev = await tx
+          .delete(events)
+          .where(lt(events.firstSeenAt, cutoff))
+          .returning({ id: events.id })
+
+        return { events: ev.length, outbox: ob.length }
+      })
     },
   }
 }

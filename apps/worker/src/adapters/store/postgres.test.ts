@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest'
-import { getTableName, is, Param, SQL, StringChunk } from 'drizzle-orm'
+import { Column, getTableName, is, Param, SQL, StringChunk } from 'drizzle-orm'
 import type { NormalizedEvent } from '@app/shared'
 import { createPostgresStore, type Db } from './postgres.js'
 import { events, outbox } from './schema.js'
@@ -282,8 +282,33 @@ function collectParamValues(node: unknown, out: unknown[] = []): unknown[] {
     out.push(node.value)
     return out
   }
+  // inArray(col, ['a','b'])는 sql`${col} in ${values.map(...)}` 로 만들어지는데,
+  // 이 배열은 SQL로 감싸이지 않은 채 queryChunks에 그대로 박힌다(drizzle-orm
+  // sql/sql.js의 buildQueryFromSourceParams가 Array.isArray(chunk)를 별도로
+  // 처리하는 것과 같은 이유) — 이 분기가 없으면 inArray 안의 Param들이 전부 누락된다.
+  if (Array.isArray(node)) {
+    for (const item of node) collectParamValues(item, out)
+    return out
+  }
   if (node instanceof SQL) {
     for (const chunk of node.queryChunks) collectParamValues(chunk, out)
+  }
+  return out
+}
+
+/** SQL 조각 트리에서 실제로 참조된 Column들을 모은다 — inArray/eq/lt 가 어떤 컬럼을
+ * 대상으로 하는지(예: outbox.status vs outbox.eventId) 확인하는 데 쓴다. */
+function collectColumns(node: unknown, out: unknown[] = []): unknown[] {
+  if (is(node, Column)) {
+    out.push(node)
+    return out
+  }
+  if (Array.isArray(node)) {
+    for (const item of node) collectColumns(item, out)
+    return out
+  }
+  if (node instanceof SQL) {
+    for (const chunk of node.queryChunks) collectColumns(chunk, out)
   }
   return out
 }
@@ -509,5 +534,107 @@ describe('lastEventKstDate — 재기동 시 lastDigestDate 복원', () => {
     const [order] = (orderByCalls[0] ?? []) as [SQL]
     expect(order.queryChunks).toContain(events.firstSeenAt)
     expect(sqlText(order).toLowerCase()).toContain('desc')
+  })
+})
+
+/**
+ * pruneOlderThan 의 `db.transaction(tx => ...)` 을 흉내내는 fake.
+ *
+ * `tx.select(...).from(...).where(cond)` 는 실행되지 않고 outbox.eventId 의
+ * inArray 서브쿼리 인자로 그대로 전달될 뿐이다 — 실제 drizzle의 PgSelect도
+ * await 되기 전까지는 실행되지 않으므로, SQLWrapper 계약(getSQL())만 지키면
+ * 충분하다. delete().where().returning() 은 where 에 전달된 조건을 테이블별로
+ * 기록하고 미리 정해둔 행을 반환한다 — 반환된 배열의 길이가 곧 삭제 건수다.
+ */
+function fakeTxDb(outboxRows: { id: number }[], eventsRows: { id: number }[]) {
+  const deletedTables: string[] = []
+  const outboxWhereConditions: unknown[] = []
+  const eventsWhereConditions: unknown[] = []
+
+  const tx = {
+    select: () => ({
+      from: () => ({
+        where: (cond: unknown) => ({ getSQL: () => cond }),
+      }),
+    }),
+    delete: (table: unknown) => {
+      const name = getTableName(table as never)
+      deletedTables.push(name)
+      return {
+        where: (cond: unknown) => {
+          if (name === 'outbox') outboxWhereConditions.push(cond)
+          else eventsWhereConditions.push(cond)
+          return {
+            returning: async () => (name === 'outbox' ? outboxRows : eventsRows),
+          }
+        },
+      }
+    },
+  }
+  const db = { transaction: async (fn: (t: unknown) => Promise<unknown>) => fn(tx) }
+  return { db: db as unknown as Db, deletedTables, outboxWhereConditions, eventsWhereConditions }
+}
+
+describe('pruneOlderThan', () => {
+  const cutoff = new Date('2026-06-22T00:00:00Z')
+
+  it('삭제된 events와 outbox 행 수를 반환한다', async () => {
+    const { db } = fakeTxDb(
+      [{ id: 1 }, { id: 2 }, { id: 3 }],
+      [{ id: 10 }, { id: 11 }],
+    )
+    const store = createPostgresStore(db)
+
+    const result = await store.pruneOlderThan(cutoff)
+
+    expect(result).toEqual({ events: 2, outbox: 3 })
+  })
+
+  it(
+    'outbox를 events보다 먼저 지운다 — outbox.event_id는 events.id를 참조하는 ' +
+      '외래키라, 순서가 바뀌면 제약 위반으로 트랜잭션이 통째로 롤백되어 보관 정책이 ' +
+      '조용히 아무 일도 하지 않게 된다',
+    async () => {
+      const { db, deletedTables } = fakeTxDb([], [])
+      await createPostgresStore(db).pruneOlderThan(cutoff)
+
+      expect(deletedTables).toEqual(['outbox', 'events'])
+    },
+  )
+
+  it(
+    'pending 상태의 outbox는 아무리 오래돼도 지우지 않는다 — ' +
+      '미발송 건을 지우면 알림이 조용히 사라지고 그 사실을 알 방법도 남지 않는다',
+    async () => {
+      const { db, outboxWhereConditions } = fakeTxDb([], [])
+      await createPostgresStore(db).pruneOlderThan(cutoff)
+
+      const cond = outboxWhereConditions[0]
+      // status 컬럼이 실제로 이 조건에 쓰였는가.
+      expect(collectColumns(cond)).toContain(outbox.status)
+
+      // sent/dead만 허용 목록에 있고 pending은 없어야 한다 — 화이트리스트 방식이라
+      // 나중에 상태값이 추가돼도(예: 'retrying') 실수로 삭제 대상에 끼지 않는다.
+      const values = collectParamValues(cond)
+      expect(values).toEqual(expect.arrayContaining(['sent', 'dead']))
+      expect(values).not.toContain('pending')
+    },
+  )
+
+  it('outbox 삭제는 events.id 서브쿼리로 eventId를 좁힌다 — cutoff보다 오래된 event에 딸린 행만 대상이다', async () => {
+    const { db, outboxWhereConditions } = fakeTxDb([], [])
+    await createPostgresStore(db).pruneOlderThan(cutoff)
+
+    const cond = outboxWhereConditions[0]
+    expect(collectColumns(cond)).toContain(outbox.eventId)
+  })
+
+  it('events 삭제는 first_seen_at < cutoff 조건을 쓴다', async () => {
+    const { db, eventsWhereConditions } = fakeTxDb([], [])
+    await createPostgresStore(db).pruneOlderThan(cutoff)
+
+    const cond = eventsWhereConditions[0]
+    expect(collectColumns(cond)).toContain(events.firstSeenAt)
+    expect(collectParamValues(cond)).toContain(cutoff)
   })
 })

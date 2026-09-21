@@ -65,4 +65,16 @@ export type EventStore = {
     /** 잘리지 않은 미매칭 총계. missedCandidates 는 상위 N건만 담으므로 이 값과 다를 수 있다. */
     missedTotal: number
   }>
+
+  /**
+   * `cutoff` 보다 오래된 events 와, 그에 딸린 **종결된**(sent/dead) outbox 행을 지운다.
+   *
+   * pending 은 아무리 오래돼도 지우지 않는다 — 미발송 건을 지우면 알림이 조용히
+   * 사라지고, 그 사실을 알 방법도 남지 않는다. 만료된 pending 은 dispatch 가
+   * expiresAt 으로 이미 정리한다.
+   *
+   * outbox 를 먼저 지운다. events.id 를 참조하는 외래키가 있어 순서가 바뀌면
+   * 제약 위반으로 트랜잭션이 통째로 실패한다.
+   */
+  pruneOlderThan(cutoff: Date): Promise<{ events: number; outbox: number }>
 }
