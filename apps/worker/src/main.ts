@@ -125,12 +125,24 @@ async function main(): Promise<void> {
   const coldStart = new Map(plans.map((p) => [p.source.id, true]))
   const nextRunAt = new Map(plans.map((p) => [p.source.id, 0]))
 
+  // 꺼져 있다는 사실을 기동 때 한 번 남긴다. 이 줄이 없으면 운영자는 "보관 정리
+  // 로그가 안 보인다"를 만났을 때 **꺼진 것**과 **고장 난 것**을 구별할 수 없다 —
+  // 둘 다 침묵으로 보인다. 켜져 있으면 하루 한 번의 'retention pruned' 가 그
+  // 역할을 하므로 여기서 따로 알리지 않는다.
+  if (!cfg.retentionEnabled) {
+    log.info(
+      { retentionEnabled: false },
+      'retention disabled — 90일 지난 행을 지우지 않는다 (RETENTION_ENABLED=true 로 켠다)',
+    )
+  }
+
   log.info(
     {
       seen: [...seen.values()].reduce((n, s) => n + s.size, 0),
       lastDigestDate,
       operatorChannel: cfg.operatorChatId !== null,
       newsEnabled: cfg.newsEnabled,
+      retentionEnabled: cfg.retentionEnabled,
     },
     'worker started',
   )
@@ -139,6 +151,7 @@ async function main(): Promise<void> {
     {
       plans, store, notifier, operatorNotifier, summarizer, heartbeat, circuit, log,
       dailyLimit: cfg.dartDailyLimit,
+      retentionEnabled: cfg.retentionEnabled,
     },
     {
       lastDigestDate,

@@ -53,6 +53,16 @@ export type CycleDeps = {
   log: CycleLogger
   /** 계정에 발급된 일일 한도. budgetGuard 와 다이제스트 분모에 그대로 흘러간다. */
   dailyLimit: number
+  /**
+   * 보관 정리(retention.ts)를 돌릴 것인가. 선택 필드가 아니라 **필수**로 둔다 —
+   * 되돌릴 수 없는 삭제의 스위치를 빠뜨렸을 때 기본값이 조용히 결정하게 두지
+   * 않는다. 호출자가 매번 명시적으로 답해야 한다.
+   *
+   * false 면 runRetention 을 아예 호출하지 않는다. lastPruneDate 도 그대로
+   * 둔다 — 날짜만 전진시키면 나중에 켰을 때 "오늘은 이미 돈 것"으로 보여
+   * 첫 스윕이 하루 늦는다.
+   */
+  retentionEnabled: boolean
 }
 
 export type CycleState = {
@@ -297,7 +307,13 @@ export async function runCycle(
     // 보관 정리도 다이제스트와 같은 자리에서, 같은 KST 날짜 기준으로 하루 한 번만
     // 돈다. runRetention 은 절대 던지지 않는다 — 던지면 아래 catch 로 가 서킷
     // 브레이커가 발동하고, 디스크 정리 실패 때문에 알림 폴링이 느려지거나 멎는다.
-    lastPruneDate = await runRetention({ store: deps.store, log: deps.log }, lastPruneDate, now)
+    //
+    // RETENTION_ENABLED 가 꺼져 있으면 호출 자체를 하지 않는다. 안에서 걸러도
+    // 결과는 같지만, 되돌릴 수 없는 삭제 경로는 진입조차 하지 않는 편이 낫다 —
+    // pruneOlderThan 이 불린 적이 없다는 사실 자체가 검증 가능한 성질이 된다.
+    if (deps.retentionEnabled) {
+      lastPruneDate = await runRetention({ store: deps.store, log: deps.log }, lastPruneDate, now)
+    }
 
     sleepMs = sleepUntilSoonest(nextRunAt, now)
   } catch (err) {

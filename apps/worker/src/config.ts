@@ -49,6 +49,15 @@ const envSchema = z.object({
   NEWS_INTERVAL_MS: optionalField(
     z.coerce.number().int().positive().default(60_000),
   ),
+  // 기본 false. 보관 정리는 이 브랜치에서 **유일하게 되돌릴 수 없는** 동작이다 —
+  // 90일 지난 events/outbox 를 영구 삭제하고, 지운 행은 어디에도 남지 않는다.
+  // 주간 덤프 백업 워크플로는 존재하지만 아직 한 번도 돌지 않았다(시크릿 등록과
+  // 첫 실행이 저장소 소유자에게 남아 있다). 검증된 백업이 뒤에 서기 전에는
+  // 삭제가 배포 24시간 안에(첫 KST 자정) 저절로 발동해서는 안 된다.
+  //
+  // NEWS_ENABLED 와 같은 모양으로 둔다: 배포와 활성화를 분리하고, 켜는 것도
+  // 끄는 것도 이미지를 되돌리지 않고 env 한 줄로 한다.
+  RETENTION_ENABLED: optionalField(z.enum(['true', 'false']).default('false')),
 })
 
 export type Config = {
@@ -70,6 +79,11 @@ export type Config = {
   newsEnabled: boolean
   /** RSS 폴링 주기(ms). 기본 60초. */
   newsIntervalMs: number
+  /**
+   * 기본 false — 켜기 전까지 **한 행도 지우지 않는다**. 삭제는 되돌릴 수 없고
+   * 백업이 아직 검증되지 않았으므로, 활성화는 사람이 명시적으로 한다.
+   */
+  retentionEnabled: boolean
 }
 
 export function loadConfig(env: Record<string, string | undefined>): Config {
@@ -84,5 +98,6 @@ export function loadConfig(env: Record<string, string | undefined>): Config {
     dartDailyLimit: parsed.DART_DAILY_LIMIT,
     newsEnabled: parsed.NEWS_ENABLED === 'true',
     newsIntervalMs: parsed.NEWS_INTERVAL_MS,
+    retentionEnabled: parsed.RETENTION_ENABLED === 'true',
   }
 }

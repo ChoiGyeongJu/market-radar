@@ -85,6 +85,8 @@ describe('runCycle — heartbeat 은 finally 에 있어야 한다 (회귀 테스
       {
         plans: [dartPlan], store: failingStore(), notifier, operatorNotifier: notifier, summarizer, heartbeat,
         circuit: createCircuit(), log, dailyLimit: 20_000,
+        // 보관 정리는 기본 꺼짐이다 — 이 테스트들은 삭제 경로를 다루지 않는다.
+        retentionEnabled: false,
       },
       warmState(),
       NOW,
@@ -105,6 +107,8 @@ describe('runCycle — heartbeat 은 finally 에 있어야 한다 (회귀 테스
       {
         plans: [dartPlan], store: healthyStore(), notifier, operatorNotifier: notifier, summarizer, heartbeat,
         circuit: createCircuit(), log, dailyLimit: 20_000,
+        // 보관 정리는 기본 꺼짐이다 — 이 테스트들은 삭제 경로를 다루지 않는다.
+        retentionEnabled: false,
       },
       warmState(),
       NOW,
@@ -124,6 +128,8 @@ describe('runCycle — heartbeat 은 finally 에 있어야 한다 (회귀 테스
       {
         plans: [dartPlan], store: failingStore(), notifier, operatorNotifier: notifier, summarizer, heartbeat,
         circuit: createCircuit(), log, dailyLimit: 20_000,
+        // 보관 정리는 기본 꺼짐이다 — 이 테스트들은 삭제 경로를 다루지 않는다.
+        retentionEnabled: false,
       },
       warmState(2),
       NOW,
@@ -198,6 +204,8 @@ describe('runLoop — 종료 신호가 대기 중에 오면 다음 사이클 없
       {
         plans: [dartPlan], store, notifier, operatorNotifier: notifier, summarizer, heartbeat,
         circuit: createCircuit(), log, dailyLimit: 20_000,
+        // 보관 정리는 기본 꺼짐이다 — 이 테스트들은 삭제 경로를 다루지 않는다.
+        retentionEnabled: false,
       },
       warmState(),
       fakeSleeper,
@@ -220,6 +228,8 @@ describe('runLoop — 종료 신호가 대기 중에 오면 다음 사이클 없
       {
         plans: [dartPlan], store, notifier, operatorNotifier: notifier, summarizer, heartbeat,
         circuit: createCircuit(), log, dailyLimit: 20_000,
+        // 보관 정리는 기본 꺼짐이다 — 이 테스트들은 삭제 경로를 다루지 않는다.
+        retentionEnabled: false,
       },
       warmState(),
       createSleeper(),
@@ -248,6 +258,8 @@ describe('runCycle — 운영자 알림은 구독자 채널로 가지 않는다'
     const deps = {
       plans: [dartPlan], store: failingStore(), notifier: subscriber, operatorNotifier: operator,
       summarizer, heartbeat, circuit, log: silentLog(), dailyLimit: 20_000,
+      // 보관 정리는 기본 꺼짐이다 — 이 테스트들은 삭제 경로를 다루지 않는다.
+      retentionEnabled: false,
     }
 
     // ALERT_THRESHOLD(5) 회째에 알림이 나간다. 소스마다 nextRunAt 과 백오프가
@@ -285,6 +297,8 @@ describe('runCycle — 운영자 알림은 구독자 채널로 가지 않는다'
       {
         plans: [dartPlan], store, notifier: subscriber, operatorNotifier: operator,
         summarizer, heartbeat, circuit: createCircuit(), log: silentLog(), dailyLimit: 20_000,
+        // 보관 정리는 기본 꺼짐이다 — 이 테스트들은 삭제 경로를 다루지 않는다.
+        retentionEnabled: false,
       },
       { ...warmState(), lastDigestDate: '2026-09-18' },
       NOW,
@@ -303,7 +317,9 @@ describe('runCycle — 운영자 알림은 구독자 채널로 가지 않는다'
  * 때문에 실시간 알림 폴링이 느려지거나 멎는다.
  */
 describe('runCycle — 보관 정리는 다이제스트와 같은 자리에서 하루 한 번 돈다', () => {
-  function retentionDeps(pruneOlderThan: ReturnType<typeof vi.fn>): CycleDeps {
+  function retentionDeps(
+    pruneOlderThan: ReturnType<typeof vi.fn>, retentionEnabled = true,
+  ): CycleDeps {
     const store = {
       incrementApiUsage: async () => 1,
       claimPending: async () => [],
@@ -319,6 +335,7 @@ describe('runCycle — 보관 정리는 다이제스트와 같은 자리에서 �
       circuit: createCircuit(),
       log: silentLog(),
       dailyLimit: 20_000,
+      retentionEnabled,
     }
   }
 
@@ -353,6 +370,39 @@ describe('runCycle — 보관 정리는 다이제스트와 같은 자리에서 �
     expect(state.lastPruneDate).toBe('2026-09-18')
     // 사이클은 실패로 던져지지 않는다 — 서킷은 그대로 성공 상태다.
     expect(deps.circuit.consecutiveFailures()).toBe(0)
+  })
+
+  it(
+    'RETENTION_ENABLED 가 꺼져 있으면 KST 날짜가 바뀌어도 한 행도 지우지 않는다 — ' +
+      '이 브랜치에서 유일하게 되돌릴 수 없는 동작이고, 검증된 백업이 아직 없다',
+    async () => {
+      const prune = vi.fn().mockResolvedValue({ events: 5, outbox: 2, pinned: 1 })
+      const deps = retentionDeps(prune, false)
+
+      const state = await runCycle(deps, { ...warmState(), lastPruneDate: '2026-09-18' }, NOW)
+
+      // 삭제 쿼리는 시도조차 되지 않아야 한다.
+      expect(prune).not.toHaveBeenCalled()
+      // 날짜도 전진시키지 않는다 — 전진시키면 나중에 켰을 때 "오늘은 이미 돈 것"
+      // 으로 보여 첫 스윕이 하루 밀린다.
+      expect(state.lastPruneDate).toBe('2026-09-18')
+      // 나머지 사이클은 평소대로 끝난다 — 스위치가 꺼졌다고 수집·발송이 멈추지 않는다.
+      expect(deps.circuit.consecutiveFailures()).toBe(0)
+    },
+  )
+
+  it('RETENTION_ENABLED 가 켜져야만 스윕이 돈다 (꺼짐/켜짐 대조)', async () => {
+    const offPrune = vi.fn().mockResolvedValue({ events: 1, outbox: 0, pinned: 0 })
+    await runCycle(
+      retentionDeps(offPrune, false), { ...warmState(), lastPruneDate: '2026-09-18' }, NOW,
+    )
+    const onPrune = vi.fn().mockResolvedValue({ events: 1, outbox: 0, pinned: 0 })
+    await runCycle(
+      retentionDeps(onPrune, true), { ...warmState(), lastPruneDate: '2026-09-18' }, NOW,
+    )
+
+    expect(offPrune).not.toHaveBeenCalled()
+    expect(onPrune).toHaveBeenCalledTimes(1)
   })
 })
 
@@ -412,6 +462,8 @@ describe('runCycle — 다중 소스', () => {
       circuit: spyCircuit(),
       log: silentLog(),
       dailyLimit: 20_000,
+      // 보관 정리는 기본 꺼짐이다 — 이 테스트들은 삭제 경로를 다루지 않는다.
+      retentionEnabled: false,
     }
   }
 

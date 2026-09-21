@@ -228,6 +228,39 @@ describe('loadConfig — NEWS_ENABLED / NEWS_INTERVAL_MS (배포와 활성화를
   })
 })
 
+// --------------------------------------------------------------------------
+// RETENTION_ENABLED — 이 브랜치에서 유일하게 되돌릴 수 없는 스위치다. 90일 지난
+// events/outbox 를 영구 삭제하며, 주간 덤프 백업은 아직 한 번도 돌지 않았다.
+// 기본값이 true 로 뒤집히면 병합 24시간 안에 첫 KST 자정에 삭제가 발동한다.
+// --------------------------------------------------------------------------
+describe('loadConfig — RETENTION_ENABLED (되돌릴 수 없으므로 기본은 꺼짐)', () => {
+  it('기본값은 false — 키를 아예 주지 않아도 삭제가 켜지지 않는다', () => {
+    expect(loadConfig(valid).retentionEnabled).toBe(false)
+  })
+
+  it('RETENTION_ENABLED=true 여야만 켜진다', () => {
+    expect(loadConfig({ ...valid, RETENTION_ENABLED: 'true' }).retentionEnabled).toBe(true)
+  })
+
+  it('RETENTION_ENABLED=false 는 그대로 꺼짐이다', () => {
+    expect(loadConfig({ ...valid, RETENTION_ENABLED: 'false' }).retentionEnabled).toBe(false)
+  })
+
+  it(
+    '빈 문자열은 꺼짐으로 접힌다 — `docker run --env-file` 은 `KEY=` 를 빈 문자열로 ' +
+      '넘기고, 그게 거부되거나 기본값을 건너뛰면 런북대로 비워둔 운영자가 다친다',
+    () => {
+      expect(loadConfig({ ...valid, RETENTION_ENABLED: '' }).retentionEnabled).toBe(false)
+      expect(loadConfig({ ...valid, RETENTION_ENABLED: '   ' }).retentionEnabled).toBe(false)
+    },
+  )
+
+  it('오타(예: `1`, `yes`)는 조용히 통과시키지 않고 거부한다', () => {
+    expect(() => loadConfig({ ...valid, RETENTION_ENABLED: '1' })).toThrow()
+    expect(() => loadConfig({ ...valid, RETENTION_ENABLED: 'yes' })).toThrow()
+  })
+})
+
 describe('loadConfig — 필수 값은 빈 문자열이어도 여전히 거부한다 (전처리로 약화되지 않는다)', () => {
   it('DATABASE_URL 빈 문자열은 거부한다', () => {
     expect(() => loadConfig({ ...valid, DATABASE_URL: '' })).toThrow(/DATABASE_URL/)
