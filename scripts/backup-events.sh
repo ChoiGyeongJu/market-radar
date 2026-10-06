@@ -43,8 +43,14 @@ psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -c "\copy (
          title, url, corp_name, ticker, market, verdict, tier, rule, raw
   FROM events ORDER BY id
 ) TO STDOUT WITH CSV HEADER" | gzip -9 > "$OUT"
-PSQL_STATUS="${PIPESTATUS[0]}"
-GZIP_STATUS="${PIPESTATUS[1]}"
+# PIPESTATUS 는 배열째 한 번에 복사해야 한다. `X="${PIPESTATUS[0]}"` 같은 대입문도
+# 그 자체가 하나의 명령이라 실행되는 순간 PIPESTATUS 를 (0) 한 원소로 덮어쓴다 —
+# 그러면 다음 줄의 PIPESTATUS[1] 은 존재하지 않고, set -u 아래에서 "unbound
+# variable" 로 죽는다. 실제로 첫 실행이 정확히 이렇게 죽었다(shellcheck 와 세 번의
+# 리뷰를 통과한 뒤였다 — 정적 검증으로는 잡히지 않는 런타임 의미론이다).
+PIPE_STATUS=("${PIPESTATUS[@]}")
+PSQL_STATUS="${PIPE_STATUS[0]}"
+GZIP_STATUS="${PIPE_STATUS[1]}"
 set -e
 
 if [ "$PSQL_STATUS" -ne 0 ] || [ "$GZIP_STATUS" -ne 0 ]; then
