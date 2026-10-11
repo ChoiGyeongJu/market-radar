@@ -22,6 +22,13 @@
       "when": 1789991490522,
       "tag": "0002_outbox_event_id_idx",
       "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "7",
+      "when": 1791706748537,
+      "tag": "0003_digest_log",
+      "breakpoints": true
     }
   ]
 }

@@ -8,6 +8,13 @@ export type DigestLogger = {
   error(obj: Record<string, unknown>, msg: string): void
 }
 
+/**
+ * 다이제스트가 집계하는 소스. 따라잡기(cycle.ts)와 기동 시 복원(main.ts)이 같은
+ * 값을 써야 한다 — 어긋나면 복원이 늘 빈 기록을 읽어 예전 방식으로 물러선다.
+ * 뉴스 다이제스트는 3c 에서 따로 붙는다.
+ */
+export const DIGEST_SOURCE_ID = 'dart'
+
 export type DigestDeps = {
   store: EventStore
   notifier: Notifier
@@ -52,6 +59,52 @@ export async function runDigest(deps: DigestDeps, kstDate: string): Promise<bool
 }
 
 /**
+ * 끝낸 날짜를 digest_log 에 남긴다. 재기동은 여기서 따라잡기 시작점을 복원한다
+ * (restoreLastDigestDate).
+ *
+ * 실패해도 던지지 않는다. 다이제스트는 이미 나갔는데 이 예외로 사이클이 실패하면
+ * lastDigestDate 가 전진하지 않아 다음 사이클이 같은 날짜를 또 보낸다 — 기록
+ * 실패(마이그레이션 미적용 등)가 이어지는 동안 매 사이클 중복 발송이 된다. 메모리
+ * 상태는 정상 전진하므로, 잃는 것은 "재기동하면 이 날짜를 다시 보낼 수 있다"
+ * 뿐이다(digest_log 가 생기기 전 동작과 같다).
+ */
+async function recordDone(deps: DigestDeps, date: string, outcome: 'sent' | 'abandoned'): Promise<void> {
+  try {
+    await deps.store.recordDigest(deps.sourceId, date, outcome)
+  } catch (err) {
+    deps.log.error({ err, date, outcome }, 'digest log write failed')
+  }
+}
+
+/**
+ * 재기동 시 따라잡기 시작점 — 마지막으로 끝낸 다이제스트의 다음 날이다.
+ *
+ * 마지막 이벤트 날짜에서 복원하면 안 된다. 그 값은 "다이제스트를 어디까지
+ * 보냈는가"가 아니라 "마지막으로 무언가를 수집한 날"이라, 공시가 없는 날(주말·
+ * 공휴일) 뒤에 재기동하면 이미 보낸 날짜들을 다시 보낸다 — 2026-10-11(일)
+ * 재기동에서 마지막 공시가 10-08(목)이라 다이제스트 3건이 중복 발송됐다.
+ *
+ * 기록이 없거나(테이블이 생긴 직후, 빈 DB) 읽지 못하면(마이그레이션 미적용)
+ * 그 예전 방식으로 물러선다. 오늘에서 시작하면 자정을 넘긴 재기동이 전날치를
+ * 영영 잃는다 — 중복이 누락보다 낫다. 읽기 실패로 기동을 막지도 않는다. 감사
+ * 기록 하나 때문에 알림 전체를 세울 이유가 없다.
+ */
+export async function restoreLastDigestDate(
+  store: Pick<EventStore, 'lastDigestKstDate' | 'lastEventKstDate'>,
+  sourceId: string,
+  today: string,
+  log: DigestLogger,
+): Promise<string> {
+  try {
+    const done = await store.lastDigestKstDate(sourceId)
+    if (done !== null) return nextKstDate(done)
+  } catch (err) {
+    log.error({ err }, 'digest log read failed — falling back to last event date')
+  }
+  return (await store.lastEventKstDate()) ?? today
+}
+
+/**
  * lastDigestDate 부터 currentKstDate 직전까지, 밀린 날짜를 하루씩 모두 보낸다.
  * `lastDigestDate = currentKstDate` 로 건너뛰면 장애가 자정을 두 번 넘겼을 때
  * 중간 날의 다이제스트가 영영 사라진다 — 다이제스트는 운영자의 유일한 사후
@@ -81,6 +134,7 @@ export async function catchUpDigests(
     // 발송 결과를 확인하지 않고 날짜를 전진시키면, 한도 초과·429·네트워크 오류로
     // 거부된 다이제스트가 조용히 사라진다. 그날의 기록은 두 번 다시 나오지 않는다.
     if (await runDigest(deps, date)) {
+      await recordDone(deps, date, 'sent')
       date = nextKstDate(date)
       attempt = null
       continue
@@ -97,6 +151,7 @@ export async function catchUpDigests(
       await deps.notifier.send(
         `⚠️ ${date} 다이제스트를 ${MAX_DIGEST_ATTEMPTS}회 재시도해도 보내지 못해 포기합니다.`,
       ).catch(() => {})
+      await recordDone(deps, date, 'abandoned')
       return { lastDigestDate: nextKstDate(date), digestAttempt: null }
     }
 

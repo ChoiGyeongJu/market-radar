@@ -11,7 +11,7 @@ import type { Heartbeat } from './health.js'
 import { runIngest } from './ingest.js'
 import type { IngestStats, SourcePlan } from './ingest.js'
 import { runDispatch } from './dispatch.js'
-import { catchUpDigests } from './digest.js'
+import { catchUpDigests, DIGEST_SOURCE_ID } from './digest.js'
 import type { DigestAttempt } from './digest.js'
 import { runRetention } from './retention.js'
 
@@ -293,7 +293,7 @@ export async function runCycle(
         notifier: deps.operatorNotifier,
         // 공시 다이제스트는 기존 그대로 DART 사용량을 분모로 쓴다. 뉴스
         // 다이제스트는 3c 에서 따로 붙인다.
-        sourceId: 'dart',
+        sourceId: DIGEST_SOURCE_ID,
         log: deps.log,
         dailyLimit: deps.dailyLimit,
       },

@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { events, outbox, apiUsage } from './schema.js'
+import { events, outbox, apiUsage, digestLog } from './schema.js'
 import { getTableConfig } from 'drizzle-orm/pg-core'
 
 describe('events 테이블', () => {
@@ -59,5 +59,13 @@ describe('api_usage 테이블', () => {
     const cfg = getTableConfig(apiUsage)
     const pk = cfg.primaryKeys[0]
     expect(pk?.columns.map((c) => c.name)).toEqual(['usage_date', 'source_id'])
+  })
+})
+
+describe('digest_log 테이블', () => {
+  it('(source_id, kst_date) 복합 PK를 가진다 — 같은 날짜를 두 번 기록하지 않고, 기동 시 조회가 이 순서를 탄다', () => {
+    const cfg = getTableConfig(digestLog)
+    const pk = cfg.primaryKeys[0]
+    expect(pk?.columns.map((c) => c.name)).toEqual(['source_id', 'kst_date'])
   })
 })
