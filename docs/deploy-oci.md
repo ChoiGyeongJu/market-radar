@@ -50,6 +50,7 @@
 | `NEWS_ENABLED` | 선택 항목 — **비워두면 꺼짐(`false`)이다.** 뉴스(RSS) 소스를 켠다. 배포와 활성화를 분리하려고 둔 스위치이므로, **뉴스가 채널을 뒤덮으면 이미지를 롤백하지 말고 이 값을 `false`로 되돌린 뒤 컨테이너만 다시 띄운다.** 꺼져 있는 동안 알림 동작은 기존 DART 단일 소스와 같다. 켜져 있으면 기동 로그에 `news source enabled`와 상장사 수가 찍힌다 |
 | `NEWS_INTERVAL_MS` | 선택 항목 — **비워두면 기본값 60,000(60초).** RSS 폴링 주기. RSS 반영 지연이 중앙값 3.5분이라 이 값을 줄여도 지연은 거의 안 줄고 대역폭만 는다(30초면 하루 1.2GB, 60초면 0.6GB) |
 | `RETENTION_ENABLED` | 선택 항목 — **비워두면 꺼짐(`false`)이다. 켜면 되돌릴 수 없다.** `true`면 매일 KST 자정 이후 첫 사이클에 90일 지난 `events`와 **종결된**(sent/dead) `outbox` 행을 **영구 삭제**한다. 켜기 전에 10번의 백업 워크플로를 최소 한 번 실제로 돌려 아티팩트의 행 수를 확인한다 — 이 프로젝트에 자동 백업은 그것 하나뿐이고, 지운 행은 어디에도 남지 않는다. 꺼져 있으면 기동 로그에 `retention disabled`가 한 줄 찍힌다(침묵이 "꺼짐"인지 "고장"인지 구별하는 신호다) |
+| `MACRO_ENABLED` | 선택 항목 — **비워두면 꺼짐(`false`).** `true`면 거시 알림(🌐 시장·거시 — 금리·무역·지정학·시장 급변)을 구독자 채널로 보낸다. `NEWS_ENABLED=true` 일 때만 의미가 있다. 꺼져 있어도 거시 **후보 표시**(`events.rule` 이 `macro:` 로 시작)는 쌓이므로, 끈 채로 며칠 돌려 아래 쿼리로 무엇이 나갔을지 본 뒤 켤 수 있다. 켜기 전에 `0004_macro_fire.sql` 이 적용돼 있어야 한다(§9.7) |
 | `DART_DAILY_LIMIT` | 선택 항목 — **비워두면 안전하게 기본값 20,000이 적용된다.** 계정에 발급된 일일 호출 한도이며, 기본값은 OpenDART 문서상 기본 한도인 20,000이다. 계정마다 다르게 발급될 수 있으므로(OpenDART 개발가이드의 인증키 신청·관리 메뉴에서 본인 계정의 실제 한도를 확인한다), 더 받았다면(예: 40,000) 그 값을 채워야 폴링이 불필요하게 일찍 느려지지 않는다 |
 
 (`LLM_MODEL`, `LLM_ENDPOINT`는 기본값이 있어 생략 가능하다. 바꿀 때만 채운다.)
@@ -253,6 +254,17 @@ select kst_date, outcome, recorded_at from digest_log order by kst_date desc lim
 
 `outcome` 이 `abandoned` 인 날은 재시도 한도를 다 쓰고 포기한 날이다(운영자
 채널에 포기 통지가 따로 나간다).
+
+`0004_macro_fire.sql`(`macro_fire` 테이블)은 `MACRO_ENABLED=true` 의 **전제**다.
+없으면 거시 트랙이 매 뉴스 사이클 `macro failed` 를 남기고 아무것도 보내지 않는다
+(공시·종목 뉴스 알림은 영향 없다). 거시 알림이 무엇을 왜 보냈고 무엇을 상한으로
+버렸는지는 이 테이블로 본다:
+
+```sql
+select fired_at, key, trigger, presses, outcome from macro_fire order by fired_at desc limit 20;
+-- 켜기 전, 후보가 어떤 키로 얼마나 쌓이는지
+select rule, count(*) from events where rule like 'macro:%' and first_seen_at > now() - interval '1 day' group by 1 order by 2 desc;
+```
 
 **배포 때마다 확인할 것** — main 에 머지하기 전에 이번 변경에 새 마이그레이션이
 있는지 본다:
