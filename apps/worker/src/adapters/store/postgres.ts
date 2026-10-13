@@ -1,9 +1,9 @@
-import { and, asc, desc, eq, gte, inArray, isNotNull, lt, lte, notExists, sql } from 'drizzle-orm'
+import { and, asc, desc, eq, gt, gte, inArray, isNotNull, like, lt, lte, notExists, sql } from 'drizzle-orm'
 import type { PostgresJsDatabase } from 'drizzle-orm/postgres-js'
 import type { NormalizedEvent, Tier } from '@app/shared'
 import type { EventStore, PendingOutbox } from '../../ports/store.js'
 import { kstDateString } from '../../core/budget.js'
-import { apiUsage, digestLog, events, outbox } from './schema.js'
+import { apiUsage, digestLog, events, macroFire, outbox } from './schema.js'
 
 export type Db = PostgresJsDatabase<Record<string, never>>
 
@@ -110,6 +110,66 @@ export function createPostgresStore(db: Db): EventStore {
 
     async recordDigest(sourceId, kstDate, outcome) {
       await db.insert(digestLog).values({ sourceId, kstDate, outcome }).onConflictDoNothing()
+    },
+
+    async macroCandidates(since) {
+      const rows = await db
+        .select({
+          id: events.id, sourceId: events.sourceId, externalId: events.externalId,
+          occurredAt: events.occurredAt, firstSeenAt: events.firstSeenAt,
+          title: events.title, url: events.url, corpName: events.corpName, ticker: events.ticker,
+          rule: events.rule, raw: events.raw,
+        })
+        .from(events)
+        .where(and(
+          // pipeline/macro.ts 의 MACRO_SOURCE_ID. 어댑터가 파이프라인을 import 하지
+          // 않도록 값만 맞춘다 — 다르면 후보가 0건이라 macro.test 가 아니라 운영에서
+          // 조용히 드러나므로 postgres.test 가 이 값을 고정한다.
+          eq(events.sourceId, 'news'),
+          like(events.rule, 'macro:%'),
+          // `>` 다 — `>=` 면 콜드 스타트 사이클에 한꺼번에 기록된 백로그가 들어온다.
+          gt(events.firstSeenAt, since),
+        ))
+        .orderBy(asc(events.firstSeenAt))
+      return rows.map((r) => ({
+        eventId: r.id,
+        rule: r.rule,
+        event: {
+          sourceId: r.sourceId,
+          externalId: r.externalId,
+          occurredAt: r.occurredAt,
+          firstSeenAt: r.firstSeenAt,
+          title: r.title,
+          url: r.url,
+          ...(r.corpName ? { subject: { name: r.corpName, ...(r.ticker ? { ticker: r.ticker } : {}) } } : {}),
+          raw: r.raw,
+        },
+      }))
+    },
+
+    async recentMacroFires(since) {
+      const rows = await db
+        .select({ key: macroFire.key, firedAt: macroFire.firedAt, outcome: macroFire.outcome })
+        .from(macroFire)
+        .where(gte(macroFire.firedAt, since))
+      return rows.map((r) => ({ key: r.key, firedAt: r.firedAt, outcome: r.outcome === 'capped' ? 'capped' : 'sent' }))
+    },
+
+    async recordMacroFire(fire, enqueue) {
+      await db.transaction(async (tx) => {
+        await tx.insert(macroFire).values(fire)
+        if (enqueue) {
+          await tx.insert(outbox).values({
+            eventId: fire.eventId,
+            tier: enqueue.tier,
+            payload: enqueue.payload as unknown as Record<string, unknown>,
+            status: 'pending',
+            attempts: 0,
+            nextAttemptAt: fire.firedAt,
+            expiresAt: enqueue.expiresAt,
+          })
+        }
+      })
     },
 
     async lastDigestKstDate(sourceId) {

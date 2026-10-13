@@ -282,3 +282,18 @@ describe('loadConfig — 필수 값은 빈 문자열이어도 여전히 거부�
     expect(() => loadConfig({ ...valid, LLM_API_KEY: '' })).toThrow(/LLM_API_KEY/)
   })
 })
+
+describe('loadConfig — MACRO_ENABLED (구독자 채널에 새 종류의 알림이 나가므로 기본은 꺼짐)', () => {
+  it('기본값은 false', () => {
+    expect(loadConfig(valid).macroEnabled).toBe(false)
+  })
+
+  it('MACRO_ENABLED=true 여야만 켜진다', () => {
+    expect(loadConfig({ ...valid, MACRO_ENABLED: 'true' }).macroEnabled).toBe(true)
+    expect(loadConfig({ ...valid, MACRO_ENABLED: 'false' }).macroEnabled).toBe(false)
+  })
+
+  it('빈 문자열은 꺼짐으로 접힌다 — `--env-file` 의 `KEY=`', () => {
+    expect(loadConfig({ ...valid, MACRO_ENABLED: '' }).macroEnabled).toBe(false)
+  })
+})

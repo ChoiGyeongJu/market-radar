@@ -150,6 +150,7 @@ async function main(): Promise<void> {
       operatorChannel: cfg.operatorChatId !== null,
       newsEnabled: cfg.newsEnabled,
       retentionEnabled: cfg.retentionEnabled,
+      macroEnabled: cfg.macroEnabled,
     },
     'worker started',
   )
@@ -159,6 +160,7 @@ async function main(): Promise<void> {
       plans, store, notifier, operatorNotifier, summarizer, heartbeat, circuit, log,
       dailyLimit: cfg.dartDailyLimit,
       retentionEnabled: cfg.retentionEnabled,
+      macroEnabled: cfg.macroEnabled,
     },
     {
       lastDigestDate,
@@ -172,6 +174,8 @@ async function main(): Promise<void> {
       seen,
       coldStart,
       nextRunAt,
+      // 뉴스의 첫 콜드 스타트 사이클이 채운다(CycleState.macroFloor).
+      macroFloor: null,
       // 서킷도 소스별이다. 첫 실행 때 소스 id 를 보고 만들어 넣는다.
       circuits: new Map(),
     },

@@ -33,6 +33,20 @@ export const FEEDS: readonly FeedConfig[] = [
   { id: 'hk-fin', pressId: 'hk', press: '한국경제', url: 'https://www.hankyung.com/feed/finance' },
   { id: 'chosunbiz', pressId: 'chosunbiz', press: '조선비즈', url: 'https://biz.chosun.com/arc/outboundfeeds/rss/category/stock/?outputType=xml' },
   { id: 'mk-stock', pressId: 'mk', press: '매일경제', url: 'https://www.mk.co.kr/rss/50200011/' },
+  // 거시 트랙(3c)용 섹션 피드. 위 증권 섹션 피드들은 북한·국제 뉴스를 싣지 않아,
+  // 지정학 사건이 매체 한 곳에만 잡혔다. 2026-10-13 수집분(1,096건) 기준으로 위
+  // 피드들이 대신 줄 수 없는 거시 후보가 있는 것만 넣었다 — 연합 북한 14건·국제 5건,
+  // 조선비즈 국제 6건, 뉴시스 국제 7건. 넷 다 종목 트랙 통과는 0건이라 종목 알림을
+  // 늘리지 않는다.
+  //
+  // 넣지 않은 것: 연합 최신(news.xml) — 모든 분야 하루 2,500건이라 행 수가 몇 배가
+  // 되는데 거시 후보는 다른 연합 피드에 이미 다 있었다. 연합인포맥스 — 거시 후보 3건을
+  // 더 주지만 종목 트랙 통과가 하루 ~30건 늘었다. 연합 경제 — 거시 1건에 "신제품 출시"
+  // 류 종목 알림 하루 ~4건.
+  { id: 'yna-nk', pressId: 'yna', press: '연합뉴스', url: 'https://www.yna.co.kr/rss/northkorea.xml' },
+  { id: 'yna-intl', pressId: 'yna', press: '연합뉴스', url: 'https://www.yna.co.kr/rss/international.xml' },
+  { id: 'chosun-intl', pressId: 'chosunbiz', press: '조선비즈', url: 'https://biz.chosun.com/arc/outboundfeeds/rss/category/international/?outputType=xml' },
+  { id: 'newsis-intl', pressId: 'newsis', press: '뉴시스', url: 'https://www.newsis.com/RSS/international.xml' },
 ]
 
 /**

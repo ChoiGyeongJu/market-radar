@@ -51,15 +51,32 @@ const TIER_MARK: Record<Tier, string> = { critical: '🔴', high: '🟠', normal
  * 쓰고 방향(호재/악재)을 뜻하지 않는다. 스펙 §7.
  */
 export function formatNewsEvent(e: NormalizedEvent, tier: Tier): string {
-  const raw = e.raw as { press?: string } | null
-  const press = typeof raw?.press === 'string' ? raw.press : null
+  const source = sourceLabel(e)
   const lines = [
-    `${TIER_MARK[tier]} *뉴스*`,
+    `${TIER_MARK[tier]} ${macroOf(e) === null ? '*뉴스*' : '🌐 *시장·거시*'}`,
     escapeMarkdownV2(e.title),
   ]
-  if (press) lines.push(`출처: ${escapeMarkdownV2(press)}`)
+  if (source) lines.push(`출처: ${escapeMarkdownV2(source)}`)
   lines.push(escapeMarkdownV2(e.url), '', DISCLAIMER)
   return lines.join('\n')
+}
+
+/**
+ * 거시 알림이면 발화 시점의 매체 수(pipeline/macro.ts 가 payload.raw.macro 에 싣는다).
+ * 아니면 null. 해석(어느 업종·종목에 영향인지)은 싣지 않는다 — 스펙 §7.
+ */
+function macroOf(e: NormalizedEvent): { presses: number } | null {
+  const macro = (e.raw as { macro?: { presses?: unknown } } | null)?.macro
+  return typeof macro?.presses === 'number' ? { presses: macro.presses } : null
+}
+
+/** "연합뉴스", 거시면 "연합뉴스 외 2곳". 여러 매체가 썼다는 것이 이 알림이 나간 이유다. */
+function sourceLabel(e: NormalizedEvent): string | null {
+  const raw = e.raw as { press?: string } | null
+  const press = typeof raw?.press === 'string' ? raw.press : null
+  if (!press) return null
+  const others = (macroOf(e)?.presses ?? 1) - 1
+  return others > 0 ? `${press} 외 ${others}곳` : press
 }
 
 /** 뉴스 병합. formatMerged 를 쓰면 subjectLine 이 subject 없는 뉴스에서 undefined 를 찍는다. */
@@ -68,9 +85,10 @@ export function formatNewsMerged(
 ): string {
   const head = `📰 뉴스 ${items.length}건`
   const body = items.map(({ event, tier }) => {
-    const raw = event.raw as { press?: string } | null
-    const press = typeof raw?.press === 'string' ? `\\[${escapeMarkdownV2(raw.press)}\\] ` : ''
-    return `${TIER_MARK[tier]} ${press}${escapeMarkdownV2(event.title)}\n${escapeMarkdownV2(event.url)}`
+    const source = sourceLabel(event)
+    const label = source ? `\\[${escapeMarkdownV2(source)}\\] ` : ''
+    const globe = macroOf(event) === null ? '' : '🌐 '
+    return `${TIER_MARK[tier]} ${globe}${label}${escapeMarkdownV2(event.title)}\n${escapeMarkdownV2(event.url)}`
   })
   return [head, '', ...body, '', DISCLAIMER].join('\n')
 }

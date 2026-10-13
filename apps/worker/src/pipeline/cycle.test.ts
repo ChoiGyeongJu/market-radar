@@ -39,6 +39,7 @@ function warmState(heartbeatFailures = 0): CycleState {
     coldStart: new Map([['dart', false]]),
     nextRunAt: new Map(),
     circuits: new Map(),
+    macroFloor: null,
   }
 }
 
@@ -88,6 +89,7 @@ describe('runCycle — heartbeat 은 finally 에 있어야 한다 (회귀 테스
         circuit: createCircuit(), log, dailyLimit: 20_000,
         // 보관 정리는 기본 꺼짐이다 — 이 테스트들은 삭제 경로를 다루지 않는다.
         retentionEnabled: false,
+        macroEnabled: false,
       },
       warmState(),
       NOW,
@@ -110,6 +112,7 @@ describe('runCycle — heartbeat 은 finally 에 있어야 한다 (회귀 테스
         circuit: createCircuit(), log, dailyLimit: 20_000,
         // 보관 정리는 기본 꺼짐이다 — 이 테스트들은 삭제 경로를 다루지 않는다.
         retentionEnabled: false,
+        macroEnabled: false,
       },
       warmState(),
       NOW,
@@ -131,6 +134,7 @@ describe('runCycle — heartbeat 은 finally 에 있어야 한다 (회귀 테스
         circuit: createCircuit(), log, dailyLimit: 20_000,
         // 보관 정리는 기본 꺼짐이다 — 이 테스트들은 삭제 경로를 다루지 않는다.
         retentionEnabled: false,
+        macroEnabled: false,
       },
       warmState(2),
       NOW,
@@ -207,6 +211,7 @@ describe('runLoop — 종료 신호가 대기 중에 오면 다음 사이클 없
         circuit: createCircuit(), log, dailyLimit: 20_000,
         // 보관 정리는 기본 꺼짐이다 — 이 테스트들은 삭제 경로를 다루지 않는다.
         retentionEnabled: false,
+        macroEnabled: false,
       },
       warmState(),
       fakeSleeper,
@@ -231,6 +236,7 @@ describe('runLoop — 종료 신호가 대기 중에 오면 다음 사이클 없
         circuit: createCircuit(), log, dailyLimit: 20_000,
         // 보관 정리는 기본 꺼짐이다 — 이 테스트들은 삭제 경로를 다루지 않는다.
         retentionEnabled: false,
+        macroEnabled: false,
       },
       warmState(),
       createSleeper(),
@@ -261,6 +267,7 @@ describe('runCycle — 운영자 알림은 구독자 채널로 가지 않는다'
       summarizer, heartbeat, circuit, log: silentLog(), dailyLimit: 20_000,
       // 보관 정리는 기본 꺼짐이다 — 이 테스트들은 삭제 경로를 다루지 않는다.
       retentionEnabled: false,
+      macroEnabled: false,
     }
 
     // ALERT_THRESHOLD(5) 회째에 알림이 나간다. 소스마다 nextRunAt 과 백오프가
@@ -304,6 +311,7 @@ describe('runCycle — 운영자 알림은 구독자 채널로 가지 않는다'
         summarizer, heartbeat, circuit: createCircuit(), log: silentLog(), dailyLimit: 20_000,
         // 보관 정리는 기본 꺼짐이다 — 이 테스트들은 삭제 경로를 다루지 않는다.
         retentionEnabled: false,
+        macroEnabled: false,
       },
       { ...warmState(), lastDigestDate: '2026-09-18' },
       NOW,
@@ -342,6 +350,7 @@ describe('runCycle — 보관 정리는 다이제스트와 같은 자리에서 �
       log: silentLog(),
       dailyLimit: 20_000,
       retentionEnabled,
+      macroEnabled: false,
     }
   }
 
@@ -470,6 +479,7 @@ describe('runCycle — 다중 소스', () => {
       dailyLimit: 20_000,
       // 보관 정리는 기본 꺼짐이다 — 이 테스트들은 삭제 경로를 다루지 않는다.
       retentionEnabled: false,
+      macroEnabled: false,
     }
   }
 
@@ -485,6 +495,7 @@ describe('runCycle — 다중 소스', () => {
       coldStart: new Map(plans.map((p) => [p.source.id, false])),
       nextRunAt: new Map(),
       circuits: new Map(),
+      macroFloor: null,
     }
   }
 
@@ -520,6 +531,83 @@ describe('runCycle — 다중 소스', () => {
     const deps = depsWith([bad, good])
     await runCycle(deps, initialState([bad, good]), new Date('2026-09-21T01:00:00Z'))
     expect(good.source.fetchLatest).toHaveBeenCalledTimes(1)
+  })
+
+  /**
+   * 거시 트랙(3c). 콜드 스타트 시각을 바닥으로 삼고, 뉴스를 수집한 사이클에서만,
+   * 켜져 있을 때만, 발송보다 먼저 돈다. 실패해도 사이클을 무너뜨리지 않는다.
+   */
+  describe('거시 트랙 배선', () => {
+    function macroDeps(plans: readonly SourcePlan[], macroEnabled = true) {
+      const deps = depsWith(plans)
+      const calls: string[] = []
+      const store = deps.store as unknown as Record<string, unknown>
+      store.macroCandidates = vi.fn(async () => { calls.push('macroCandidates'); return [] })
+      store.recentMacroFires = vi.fn(async () => [])
+      store.recordMacroFire = vi.fn(async () => {})
+      store.claimPending = vi.fn(async () => { calls.push('claimPending'); return [] })
+      return { deps: { ...deps, macroEnabled }, calls, store }
+    }
+
+    it('뉴스 콜드 스타트 사이클은 그 시각을 바닥으로 남기고 거시 트랙을 돌리지 않는다', async () => {
+      const news = fakePlan('news', 60_000)
+      const { deps, store } = macroDeps([news])
+      const state = { ...initialState([news]), coldStart: new Map([['news', true]]) }
+
+      const next = await runCycle(deps, state, MULTI_NOW)
+      expect(next.macroFloor).toEqual(MULTI_NOW)
+      expect(store.macroCandidates).not.toHaveBeenCalled()
+    })
+
+    it('콜드 스타트 이후에는 바닥과 함께 돌고, 발송보다 먼저 돈다', async () => {
+      const news = fakePlan('news', 60_000)
+      const { deps, calls } = macroDeps([news])
+      const floor = new Date(MULTI_NOW.getTime() - 5 * 60_000)
+      const next = await runCycle(deps, { ...initialState([news]), macroFloor: floor }, MULTI_NOW)
+
+      // 같은 사이클의 runDispatch 가 방금 넣은 거시 알림을 보내려면 순서가 이래야 한다.
+      expect(calls).toEqual(['macroCandidates', 'claimPending'])
+      expect(next.macroFloor).toEqual(floor) // 바닥은 재기동 전까지 그대로다
+    })
+
+    it('꺼져 있으면 돌지 않는다', async () => {
+      const news = fakePlan('news', 60_000)
+      const { deps, store } = macroDeps([news], false)
+      await runCycle(deps, { ...initialState([news]), macroFloor: new Date(0) }, MULTI_NOW)
+      expect(store.macroCandidates).not.toHaveBeenCalled()
+    })
+
+    it('바닥이 아직 없으면 돌지 않는다 — 콜드 스타트 전이다', async () => {
+      const news = fakePlan('news', 60_000)
+      const { deps, store } = macroDeps([news])
+      await runCycle(deps, initialState([news]), MULTI_NOW)
+      expect(store.macroCandidates).not.toHaveBeenCalled()
+    })
+
+    it('뉴스를 수집하지 않은 사이클(공시만 주기)에서는 돌지 않는다', async () => {
+      const dart = fakePlan('dart', 10_000)
+      const news = fakePlan('news', 60_000)
+      const { deps, store } = macroDeps([dart, news])
+      const state = {
+        ...initialState([dart, news]),
+        macroFloor: new Date(0),
+        nextRunAt: new Map([['news', MULTI_NOW.getTime() + 30_000]]),
+      }
+      await runCycle(deps, state, MULTI_NOW)
+      expect(dart.source.fetchLatest).toHaveBeenCalled()
+      expect(store.macroCandidates).not.toHaveBeenCalled()
+    })
+
+    it('거시 트랙이 실패해도 발송은 그대로 하고 사이클 실패로 세지 않는다', async () => {
+      const news = fakePlan('news', 60_000)
+      const { deps, store } = macroDeps([news])
+      store.macroCandidates = vi.fn(async () => { throw new Error('db hiccup') })
+
+      await runCycle(deps, { ...initialState([news]), macroFloor: new Date(0) }, MULTI_NOW)
+      expect(deps.store.claimPending).toHaveBeenCalledTimes(1)
+      expect(deps.circuit.recordFailure).not.toHaveBeenCalled()
+      expect(deps.log.error).toHaveBeenCalledWith(expect.anything(), 'macro failed')
+    })
   })
 
   it('심어 둔 seen-set 이 없으면 플랜의 seenCapacity 로 만든다', async () => {

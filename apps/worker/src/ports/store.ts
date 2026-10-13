@@ -51,6 +51,29 @@ export type EventStore = {
   /** 마지막으로 끝낸 다이제스트의 KST 날짜(YYYY-MM-DD). 기록이 없으면 null. */
   lastDigestKstDate(sourceId: string): Promise<string | null>
 
+  /**
+   * 거시 후보 — 뉴스 이벤트 중 rule 이 `macro:` 로 시작하고 first_seen_at 이 `since`
+   * **보다 뒤**인 것. `since` 와 같은 시각은 뺀다 — 호출자가 콜드 스타트 시각을
+   * 넘기면 그 사이클에 한꺼번에 기록된 백로그가 걸러진다(pipeline/macro.ts).
+   */
+  macroCandidates(since: Date): Promise<Array<{ eventId: number; rule: string; event: NormalizedEvent }>>
+
+  /** `since` 이후의 거시 발화 이력(sent·capped 모두). */
+  recentMacroFires(since: Date): Promise<Array<{ key: string; firedAt: Date; outcome: 'sent' | 'capped' }>>
+
+  /**
+   * 거시 발화를 기록하고, `enqueue` 가 있으면 **같은 트랜잭션에서** 대표 이벤트를
+   * outbox 에 예약한다. 둘이 갈라지면 — 예약만 되고 기록이 없으면 재기동 뒤 같은
+   * 사건을 또 보내고, 기록만 되고 예약이 없으면 보낸 줄 알고 영영 안 보낸다.
+   */
+  recordMacroFire(
+    fire: {
+      key: string; firedAt: Date; eventId: number; presses: number
+      trigger: 'breaking' | 'presses'; outcome: 'sent' | 'capped'
+    },
+    enqueue: { tier: Tier; payload: NormalizedEvent; expiresAt: Date } | null,
+  ): Promise<void>
+
   claimPending(now: Date, limit: number): Promise<PendingOutbox[]>
   markSent(outboxId: number): Promise<void>
   /**

@@ -231,3 +231,36 @@ describe('reserved character invariant — 뉴스 메시지의 MarkdownV2 유효
     assertNoUnescapedReserved(s, intentional)
   })
 })
+
+describe('거시 알림 형식 (payload.raw.macro)', () => {
+  const macroEvent = (title: string, presses: number) => ({
+    ...newsEvent(title), raw: { press: '연합뉴스', macro: { presses } },
+  })
+
+  it('머리글이 뉴스가 아니라 시장·거시이고, 출처에 다른 매체 수를 붙인다', () => {
+    const s = formatNewsEvent(macroEvent('[속보] 코스피 매도 사이드카 발동', 3), 'high')
+    expect(s.split('\n')[0]).toBe('🟠 🌐 *시장·거시*')
+    expect(s).toContain('출처: 연합뉴스 외 2곳')
+    expect(s).toContain(DISCLAIMER)
+  })
+
+  it('한 매체뿐(속보로 발화)이면 "외 0곳" 을 붙이지 않는다', () => {
+    const s = formatNewsEvent(macroEvent('[속보] 北 탄도미사일 발사', 1), 'high')
+    expect(s).toContain('출처: 연합뉴스\n')
+    expect(s).not.toContain('외')
+  })
+
+  it('병합 메시지에서도 거시 줄을 구분한다', () => {
+    const s = formatNewsMerged([
+      { event: newsEvent('한미약품 수주 계약'), tier: 'high' },
+      { event: macroEvent('코스피 4% 급락', 4), tier: 'high' },
+    ])
+    expect(s).toContain('🟠 \\[연합뉴스\\] 한미약품 수주 계약')
+    expect(s).toContain('🟠 🌐 \\[연합뉴스 외 3곳\\] 코스피 4% 급락')
+  })
+
+  it('해석을 붙이지 않는다 — 어느 업종·종목에 영향인지, 호재·악재를 쓰지 않는다(스펙 §7)', () => {
+    const s = formatNewsEvent(macroEvent('트럼프, 中에 100% 추가 관세', 5), 'high')
+    for (const w of ['호재', '악재', '수혜', '영향', '매수', '매도']) expect(s).not.toContain(w)
+  })
+})

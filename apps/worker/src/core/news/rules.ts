@@ -1,6 +1,7 @@
 import type { Evaluation, NormalizedEvent } from '@app/shared'
 import { matchCorp, type CorpIndex } from './corp-index.js'
 import { NEWS_TIERS } from './keywords.js'
+import { matchMacro } from './macro.js'
 
 /** 표현 변형을 흡수하기 위해 공백을 지운다 — `계약 체결` 과 `계약체결` 이 같아진다. */
 function squash(s: string): string {
@@ -38,10 +39,11 @@ export function evaluateNews(
   // 때문이다 — "삼성 전자제품" → "삼성전자제품" 은 "삼성전자" 를 포함하고,
   // "현대 차량" 은 "현대차" 를 포함한다. 종목명은 표현 변형이 거의 없어 얻을 것도 없다.
   //
-  // 매크로 트랙(3c)이 붙기 전까지 여기서 막힌 것은 전부 drop 이지만, events 에는
-  // 그대로 기록되어 3c·3d 튜닝 근거가 된다.
+  // 여기서 막힌 것 중 거시 게이트(주체+행위)를 통과한 것은 사유가 `macro:<키>` 가
+  // 되어 거시 트랙의 후보가 된다(macroOr). 나머지도 events 에 그대로 기록되어
+  // 튜닝 근거가 된다.
   const corp = matchCorp(event.title, index)
-  if (!corp) return { verdict: { action: 'drop', reason: 'no-corp-match' } }
+  if (!corp) return macroOr({ verdict: { action: 'drop', reason: 'no-corp-match' } }, event.title)
 
   // 여기서부터는 어느 경로로 빠져나가든 매칭된 회사를 함께 들고 나간다.
   // CorpEntry({ name, ticker })를 EventSubject 로 그대로 쓴다 — market 은 명부에
@@ -62,5 +64,22 @@ export function evaluateNews(
     if (hit) return { verdict: { action: 'pass', tier, rule: `keyword:${hit}` }, subject }
   }
 
-  return { verdict: { action: 'drop', reason: 'no-keyword-match' }, subject }
+  return macroOr({ verdict: { action: 'drop', reason: 'no-keyword-match' }, subject }, event.title)
+}
+
+/**
+ * 종목 트랙에서 떨어진 기사를 거시 게이트에 한 번 더 건다. 통과하면 drop 사유를
+ * `macro:<키>` 로 바꿔 남긴다 — 이 행 하나만으로는 보내지 않고, 거시 트랙
+ * (pipeline/macro.ts)이 같은 키의 행들을 모아 발화를 정한다.
+ *
+ * verdict 는 drop 그대로다. 기사 한 건에 대한 판정은 "이것만으로는 보내지 않는다"가
+ * 맞고, 보낸 사실은 macro_fire 와 outbox 가 기록한다. pass 로 바꾸면 수집 단계가
+ * 곧바로 outbox 에 넣어 클러스터 판정 없이 나간다.
+ *
+ * 종목 트랙을 통과한 기사는 여기 오지 않는다 — 이미 개별 알림으로 나간다.
+ */
+function macroOr(evaluation: Evaluation, title: string): Evaluation {
+  const macro = matchMacro(title)
+  if (!macro) return evaluation
+  return { ...evaluation, verdict: { action: 'drop', reason: `macro:${macro.key}` } }
 }

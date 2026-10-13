@@ -14,6 +14,7 @@ import { runDispatch } from './dispatch.js'
 import { catchUpDigests, DIGEST_SOURCE_ID } from './digest.js'
 import type { DigestAttempt } from './digest.js'
 import { runRetention } from './retention.js'
+import { MACRO_SOURCE_ID, runMacro } from './macro.js'
 
 /**
  * main.ts 는 `main().catch(...)` 를 모듈 로드 시점에 바로 실행하므로 테스트에서
@@ -63,6 +64,14 @@ export type CycleDeps = {
    * 첫 스윕이 하루 늦는다.
    */
   retentionEnabled: boolean
+  /**
+   * 거시 트랙(pipeline/macro.ts)으로 알림을 낼 것인가. 보관 정리와 같은 이유로 필수다 —
+   * 구독자 채널에 새 종류의 알림이 나가기 시작하는 스위치를 기본값에 맡기지 않는다.
+   *
+   * false 여도 거시 후보 표시(events.rule 의 `macro:`)는 계속 쌓인다. 판정은 수집
+   * 단계(evaluateNews)에서 이미 끝나므로, 끈 채로 돌려 실제 후보를 모은 뒤 켤 수 있다.
+   */
+  macroEnabled: boolean
 }
 
 export type CycleState = {
@@ -91,6 +100,12 @@ export type CycleState = {
    * 닿지 못하고 운영자 알림이 영영 0건 간다. 백오프도 같은 이유로 소스별이다.
    */
   circuits: Map<string, Circuit>
+  /**
+   * 뉴스 소스가 콜드 스타트로 백로그를 기록한 시각. 거시 트랙은 이 시각 **뒤에** 처음
+   * 본 기사만 후보로 센다 — 백로그는 전부 그 시각에 기록돼 몇 시간 전 기사들이 "방금
+   * 여러 매체가 동시에 썼다"로 보인다. null 이면 아직 콜드 스타트 전이라 돌지 않는다.
+   */
+  macroFloor: Date | null
 }
 
 export type CycleResult = CycleState & { sleepMs: number }
@@ -125,6 +140,7 @@ export async function runCycle(
   let digestAttempt = state.digestAttempt
   let lastPruneDate = state.lastPruneDate
   let heartbeatFailures = state.heartbeatFailures
+  let macroFloor = state.macroFloor
   // 실패 시에는 진입 상태 그대로 돌려준다 — 특히 coldStart 가 true 로 남아야
   // 기동 직후 DART 가 불통이었던 경우에도 첫 성공 사이클이 억제 사이클이 된다.
   // 소스별로 나뉘었으므로 수집에 성공한 소스만 각자 내려간다 — 한 소스의 장애가
@@ -257,6 +273,22 @@ export async function runCycle(
       throw new Error('all polled sources failed', { cause: firstError })
     }
 
+    // 거시 트랙. 뉴스를 이번 사이클에 수집했을 때만 돈다 — 매 사이클(장중 10초)
+    // 돌면 뉴스가 바뀌지도 않았는데 조회만 6배가 된다. 발송보다 앞이다 — 여기서
+    // outbox 에 넣은 것을 아래 runDispatch 가 같은 사이클에 보낸다.
+    const news = ingested.find((r) => r.sourceId === MACRO_SOURCE_ID)
+    if (news?.wasColdStart) {
+      macroFloor = now
+    } else if (news && deps.macroEnabled && macroFloor !== null) {
+      // 던지지 않는다. 거시 트랙의 실패가 공시 발송을 막으면 안 된다 — 사이클 실패로
+      // 번지면 서킷 브레이커가 공시 폴링까지 늦춘다.
+      try {
+        await runMacro({ store: deps.store, log: deps.log }, now, macroFloor)
+      } catch (err) {
+        deps.log.error({ err }, 'macro failed')
+      }
+    }
+
     const dispatch = await runDispatch(
       { store: deps.store, notifier: deps.notifier, summarizer: deps.summarizer }, now,
     )
@@ -375,6 +407,7 @@ export async function runCycle(
     coldStart,
     nextRunAt,
     circuits,
+    macroFloor,
   }
 }
 
