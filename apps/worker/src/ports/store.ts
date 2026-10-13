@@ -36,11 +36,20 @@ export type EventStore = {
   /**
    * 가장 최근 events.first_seen_at 의 KST 날짜(YYYY-MM-DD). 행이 없으면 null.
    *
-   * lastDigestDate 를 메모리에만 두면 KST 자정을 넘긴 재기동이 그 값을 오늘로
-   * 되돌려 전날 다이제스트가 영영 발송되지 않는다 — 따라잡기 루프가 통째로
-   * 무력화된다.
+   * lastDigestDate 복원의 **물러설 자리**다 — digest_log 가 비었거나 읽히지 않을
+   * 때만 쓴다(pipeline/digest.ts 의 restoreLastDigestDate). 이벤트 없는 날 뒤에
+   * 재기동하면 이미 보낸 날짜를 다시 보내므로 주 경로로 쓰면 안 된다.
    */
   lastEventKstDate(): Promise<string | null>
+
+  /**
+   * 다이제스트 하나를 끝냈다고 기록한다 — 보냈거나(`sent`) 재시도 한도를 다 써서
+   * 포기했거나(`abandoned`). 같은 날짜를 다시 기록해도 오류가 아니다(첫 기록이 남는다).
+   */
+  recordDigest(sourceId: string, kstDate: string, outcome: 'sent' | 'abandoned'): Promise<void>
+
+  /** 마지막으로 끝낸 다이제스트의 KST 날짜(YYYY-MM-DD). 기록이 없으면 null. */
+  lastDigestKstDate(sourceId: string): Promise<string | null>
 
   claimPending(now: Date, limit: number): Promise<PendingOutbox[]>
   markSent(outboxId: number): Promise<void>

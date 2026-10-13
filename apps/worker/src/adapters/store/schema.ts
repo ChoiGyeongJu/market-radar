@@ -56,3 +56,25 @@ export const apiUsage = pgTable('api_usage', {
 }, (t) => ({
   pk: primaryKey({ columns: [t.usageDate, t.sourceId] }),
 }))
+
+/**
+ * 끝낸 다이제스트의 날짜. 재기동 시 따라잡기 시작점을 여기서 복원한다.
+ *
+ * 전에는 마지막 이벤트 날짜(events.first_seen_at)에서 복원했는데, 그 값은 "다이제스트를
+ * 어디까지 보냈는가"가 아니라 "마지막으로 무언가를 수집한 날"이다. 공시가 없는
+ * 날(주말·공휴일) 뒤에 재기동하면 이미 보낸 날짜들을 다시 보냈다 — 2026-10-11
+ * 재기동에서 10-08~10-10 다이제스트 3건이 중복 발송됐다.
+ *
+ * 성공한 다이제스트는 워커 로그에 남지 않으므로, 서버 쪽에서 "어제 다이제스트가
+ * 나갔는가"에 답할 수 있는 유일한 기록이기도 하다.
+ */
+export const digestLog = pgTable('digest_log', {
+  sourceId: text('source_id').notNull(),
+  kstDate: date('kst_date').notNull(),
+  /** 'sent' | 'abandoned'. 포기한 날짜도 남겨야 재기동이 그 날짜를 다시 붙잡지 않는다. */
+  outcome: text('outcome').notNull(),
+  recordedAt: timestamp('recorded_at', { withTimezone: true }).notNull().defaultNow(),
+}, (t) => ({
+  // source_id 가 앞이다 — 기동 시 조회가 `source_id = ? ORDER BY kst_date DESC LIMIT 1` 이다.
+  pk: primaryKey({ columns: [t.sourceId, t.kstDate] }),
+}))

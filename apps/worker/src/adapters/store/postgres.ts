@@ -3,7 +3,7 @@ import type { PostgresJsDatabase } from 'drizzle-orm/postgres-js'
 import type { NormalizedEvent, Tier } from '@app/shared'
 import type { EventStore, PendingOutbox } from '../../ports/store.js'
 import { kstDateString } from '../../core/budget.js'
-import { apiUsage, events, outbox } from './schema.js'
+import { apiUsage, digestLog, events, outbox } from './schema.js'
 
 export type Db = PostgresJsDatabase<Record<string, never>>
 
@@ -106,6 +106,23 @@ export function createPostgresStore(db: Db): EventStore {
         .limit(1)
       const latest = rows[0]?.firstSeenAt
       return latest ? kstDateString(latest) : null
+    },
+
+    async recordDigest(sourceId, kstDate, outcome) {
+      await db.insert(digestLog).values({ sourceId, kstDate, outcome }).onConflictDoNothing()
+    },
+
+    async lastDigestKstDate(sourceId) {
+      // date 컬럼은 postgres-js 드라이버에서 'YYYY-MM-DD' 문자열 그대로 온다 —
+      // drizzle 이 1082(date) 파서를 투명 파서로 바꿔 둔다. Date 로 바꾸면 UTC
+      // 자정으로 해석돼 KST 날짜와 하루 어긋날 여지가 생긴다.
+      const rows = await db
+        .select({ kstDate: digestLog.kstDate })
+        .from(digestLog)
+        .where(eq(digestLog.sourceId, sourceId))
+        .orderBy(desc(digestLog.kstDate))
+        .limit(1)
+      return rows[0]?.kstDate ?? null
     },
 
     async claimPending(now, limit) {

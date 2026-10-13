@@ -280,8 +280,11 @@ describe('runCycle — 운영자 알림은 구독자 채널로 가지 않는다'
     expect(subscriber.send).not.toHaveBeenCalled()
   })
 
-  it('다이제스트는 operatorNotifier 로만 간다', async () => {
+  it('다이제스트는 operatorNotifier 로만 가고, 보낸 날짜를 공시 소스로 기록한다', async () => {
     const { subscriber, operator } = notifierPair()
+    // 기록의 소스가 기동 시 복원(main.ts)의 소스와 어긋나면 복원이 늘 빈 기록을 읽어
+    // 재기동 중복 발송이 그대로 남는다.
+    const recordDigest = vi.fn(async () => {})
     const store = {
       incrementApiUsage: async () => 1,
       claimPending: async () => [],
@@ -290,6 +293,7 @@ describe('runCycle — 운영자 알림은 구독자 채널로 가지 않는다'
         dead: 0, missedCandidates: [], errorCounts: {}, missedTotal: 0,
       }),
       getApiUsage: async () => 0,
+      recordDigest,
     } as unknown as EventStore
     const heartbeat: Heartbeat = { ping: vi.fn(async () => true) }
 
@@ -308,6 +312,7 @@ describe('runCycle — 운영자 알림은 구독자 채널로 가지 않는다'
     expect(operator.send).toHaveBeenCalledTimes(1)
     expect(vi.mocked(operator.send).mock.calls[0]?.[0]).toContain('리포트')
     expect(subscriber.send).not.toHaveBeenCalled()
+    expect(recordDigest.mock.calls).toEqual([['dart', '2026-09-18', 'sent']])
   })
 })
 

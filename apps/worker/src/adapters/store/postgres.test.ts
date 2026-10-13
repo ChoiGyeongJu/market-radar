@@ -2,7 +2,7 @@ import { describe, it, expect, vi } from 'vitest'
 import { Column, getTableName, is, Param, SQL, StringChunk } from 'drizzle-orm'
 import type { NormalizedEvent } from '@app/shared'
 import { createPostgresStore, type Db } from './postgres.js'
-import { events, outbox } from './schema.js'
+import { digestLog, events, outbox } from './schema.js'
 
 const event: NormalizedEvent = {
   sourceId: 'dart',
@@ -564,6 +564,57 @@ describe('lastEventKstDate — 재기동 시 lastDigestDate 복원', () => {
     const [order] = (orderByCalls[0] ?? []) as [SQL]
     expect(order.queryChunks).toContain(events.firstSeenAt)
     expect(sqlText(order).toLowerCase()).toContain('desc')
+  })
+})
+
+describe('digest_log — 끝낸 다이제스트 날짜의 기록과 복원', () => {
+  it('recordDigest 는 digest_log 에 넣고, 이미 있으면 아무것도 하지 않는다', async () => {
+    const inserted: Array<{ table: string; values: unknown; onConflict: boolean }> = []
+    const db = {
+      insert: (table: unknown) => ({
+        values: (values: unknown) => ({
+          onConflictDoNothing: async () => {
+            inserted.push({ table: getTableName(table as never), values, onConflict: true })
+          },
+        }),
+      }),
+    }
+    await createPostgresStore(db as unknown as Db).recordDigest('dart', '2026-10-10', 'sent')
+
+    expect(inserted).toEqual([{
+      table: 'digest_log',
+      values: { sourceId: 'dart', kstDate: '2026-10-10', outcome: 'sent' },
+      onConflict: true,
+    }])
+  })
+
+  it('lastDigestKstDate 는 digest_log 에서 소스로 좁혀 kst_date 내림차순 1건을 고른다', async () => {
+    const fromTables: string[] = []
+    const { db, whereCalls, orderByCalls } = fakeThenableDb([{ kstDate: '2026-10-10' }])
+    const select = (db as unknown as { select: () => { from: (t: unknown) => unknown } }).select
+    const tracked = {
+      select: () => {
+        const chain = select()
+        const from = chain.from
+        chain.from = (t: unknown) => { fromTables.push(getTableName(t as never)); return from(t) }
+        return chain
+      },
+    }
+
+    expect(await createPostgresStore(tracked as unknown as Db).lastDigestKstDate('dart'))
+      .toBe('2026-10-10')
+    expect(fromTables).toEqual(['digest_log'])
+    // 좁히지 않으면 3c 에서 뉴스 다이제스트가 붙는 날 공시 다이제스트가 뉴스 쪽 기록을
+    // 보고 날짜를 건너뛴다.
+    expect(collectParamValues(whereCalls[0])).toContain('dart')
+    const [order] = (orderByCalls[0] ?? []) as [SQL]
+    expect(order.queryChunks).toContain(digestLog.kstDate)
+    expect(sqlText(order).toLowerCase()).toContain('desc')
+  })
+
+  it('lastDigestKstDate 는 기록이 없으면 null 을 반환한다 — 호출자가 예전 방식으로 물러선다', async () => {
+    const { db } = fakeThenableDb([])
+    expect(await createPostgresStore(db).lastDigestKstDate('dart')).toBeNull()
   })
 })
 

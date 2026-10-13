@@ -2,12 +2,16 @@ import { describe, it, expect, vi } from 'vitest'
 import type { EventStore } from '../ports/store.js'
 import type { Notifier } from '../ports/notifier.js'
 import { MAX_DIGEST_ATTEMPTS } from '../core/digest.js'
-import { catchUpDigests, type DigestAttempt, type DigestLogger } from './digest.js'
+import { catchUpDigests, restoreLastDigestDate, type DigestAttempt, type DigestLogger } from './digest.js'
 
-function deps(digestFor: EventStore['digestFor'], send: Notifier['send'], log?: DigestLogger) {
+function deps(
+  digestFor: EventStore['digestFor'], send: Notifier['send'], log?: DigestLogger,
+  recordDigest: EventStore['recordDigest'] = vi.fn(async () => {}),
+) {
   const store = {
     digestFor,
     getApiUsage: async () => 0,
+    recordDigest,
   } as unknown as EventStore
   return {
     store, notifier: { send }, sourceId: 'dart', log: log ?? { error: vi.fn() }, dailyLimit: 20_000,
@@ -224,4 +228,120 @@ describe('catchUpDigests — 영원히 보낼 수 없는 다이제스트는 한�
     },
     1_000,
   )
+})
+
+/**
+ * 재기동 중복 발송 회귀. lastDigestDate 를 마지막 이벤트 날짜에서 복원하던 때는
+ * 공시가 없는 날(주말·공휴일) 뒤에 재기동하면 이미 보낸 날짜를 다시 보냈다 —
+ * 2026-10-11(일) 재기동에서 마지막 공시가 10-08(목)이라 10-08~10-10 다이제스트
+ * 3건이 중복 발송됐다. 끝낸 날짜를 digest_log 에 남기고 거기서 복원한다.
+ */
+describe('catchUpDigests — 끝낸 날짜를 digest_log 에 남긴다', () => {
+  const failed = { ok: false, retryAfterMs: null, error: 'MESSAGE_TOO_LONG' } as const
+
+  it('보낸 날짜마다 순서대로 sent 로 기록한다', async () => {
+    const digestFor = vi.fn<EventStore['digestFor']>(async () => emptyAgg)
+    const send = vi.fn(async () => ({ ok: true }) as const)
+    const recordDigest = vi.fn<EventStore['recordDigest']>(async () => {})
+    await catchUpDigests(deps(digestFor, send, undefined, recordDigest), '2026-10-08', '2026-10-11', null)
+
+    expect(recordDigest.mock.calls).toEqual([
+      ['dart', '2026-10-08', 'sent'],
+      ['dart', '2026-10-09', 'sent'],
+      ['dart', '2026-10-10', 'sent'],
+    ])
+  })
+
+  it('발송에 실패한 날짜는 기록하지 않는다 — 기록하면 재기동이 그 날짜를 건너뛴다', async () => {
+    const digestFor = vi.fn<EventStore['digestFor']>(async () => emptyAgg)
+    const send = vi.fn(async () => failed)
+    const recordDigest = vi.fn<EventStore['recordDigest']>(async () => {})
+    await catchUpDigests(deps(digestFor, send, undefined, recordDigest), '2026-10-10', '2026-10-11', null)
+
+    expect(recordDigest).not.toHaveBeenCalled()
+  })
+
+  it('포기한 날짜는 abandoned 로 기록한다 — 안 남기면 재기동마다 그 날짜를 다시 붙잡는다', async () => {
+    const digestFor = vi.fn<EventStore['digestFor']>(async () => emptyAgg)
+    const send = vi.fn(async () => failed)
+    const recordDigest = vi.fn<EventStore['recordDigest']>(async () => {})
+    const d = deps(digestFor, send, undefined, recordDigest)
+
+    let attempt: DigestAttempt | null = null
+    for (let i = 0; i < MAX_DIGEST_ATTEMPTS; i += 1) {
+      attempt = (await catchUpDigests(d, '2026-10-10', '2026-10-11', attempt)).digestAttempt
+    }
+
+    expect(recordDigest.mock.calls).toEqual([['dart', '2026-10-10', 'abandoned']])
+  })
+
+  it('기록이 실패해도 던지지 않고 전진한다 — 같은 날짜를 다시 보내지 않는다', async () => {
+    // 던지면 사이클이 실패해 lastDigestDate 가 전진하지 않고, 다음 사이클이 이미
+    // 나간 다이제스트를 또 보낸다. 기록 실패(마이그레이션 미적용 등)가 이어지는
+    // 동안 매 사이클 중복 발송이 된다 — 고치려던 것보다 나쁘다.
+    const digestFor = vi.fn<EventStore['digestFor']>(async () => emptyAgg)
+    const send = vi.fn(async () => ({ ok: true }) as const)
+    const recordDigest = vi.fn<EventStore['recordDigest']>(async () => {
+      throw new Error('relation "digest_log" does not exist')
+    })
+    const log = { error: vi.fn() }
+
+    const next = await catchUpDigests(deps(digestFor, send, log, recordDigest), '2026-10-09', '2026-10-11', null)
+
+    expect(next.lastDigestDate).toBe('2026-10-11')
+    expect(send).toHaveBeenCalledTimes(2)
+    expect(log.error).toHaveBeenCalledWith(
+      expect.objectContaining({ date: '2026-10-09' }), 'digest log write failed',
+    )
+  })
+})
+
+describe('restoreLastDigestDate — 재기동 시 따라잡기 시작점', () => {
+  function store(lastDigest: () => Promise<string | null>, lastEvent: string | null) {
+    return {
+      lastDigestKstDate: vi.fn(lastDigest),
+      lastEventKstDate: vi.fn(async () => lastEvent),
+    }
+  }
+
+  it('2026-10-11 회귀 — 이벤트 없는 날 뒤에 재기동해도 이미 보낸 날짜를 다시 보내지 않는다', async () => {
+    // 마지막 공시는 10-08 이지만 다이제스트는 10-10 치까지 나갔다.
+    const s = store(async () => '2026-10-10', '2026-10-08')
+    const restored = await restoreLastDigestDate(s, 'dart', '2026-10-11', { error: vi.fn() })
+    expect(restored).toBe('2026-10-11')
+
+    // 복원값으로 따라잡기를 돌리면 아무것도 나가지 않는다.
+    const digestFor = vi.fn<EventStore['digestFor']>(async () => emptyAgg)
+    const send = vi.fn(async () => ({ ok: true }) as const)
+    await catchUpDigests(deps(digestFor, send), restored, '2026-10-11', null)
+    expect(send).not.toHaveBeenCalled()
+  })
+
+  it('워커가 며칠 죽어 있었으면 마지막 기록 다음 날부터 따라잡는다', async () => {
+    const s = store(async () => '2026-09-30', '2026-10-01')
+    expect(await restoreLastDigestDate(s, 'dart', '2026-10-04', { error: vi.fn() })).toBe('2026-10-01')
+  })
+
+  it('조회는 주어진 소스로 한다', async () => {
+    const s = store(async () => '2026-10-10', null)
+    await restoreLastDigestDate(s, 'dart', '2026-10-11', { error: vi.fn() })
+    expect(s.lastDigestKstDate).toHaveBeenCalledWith('dart')
+  })
+
+  it('기록이 없으면(테이블이 생긴 직후) 마지막 이벤트 날짜로 물러선다', async () => {
+    const s = store(async () => null, '2026-10-10')
+    expect(await restoreLastDigestDate(s, 'dart', '2026-10-11', { error: vi.fn() })).toBe('2026-10-10')
+  })
+
+  it('기록도 이벤트도 없으면 오늘에서 시작한다', async () => {
+    const s = store(async () => null, null)
+    expect(await restoreLastDigestDate(s, 'dart', '2026-10-11', { error: vi.fn() })).toBe('2026-10-11')
+  })
+
+  it('기록을 읽지 못하면(마이그레이션 미적용) 기동을 막지 않고 마지막 이벤트 날짜로 물러선다', async () => {
+    const s = store(async () => { throw new Error('relation "digest_log" does not exist') }, '2026-10-10')
+    const log = { error: vi.fn() }
+    expect(await restoreLastDigestDate(s, 'dart', '2026-10-11', log)).toBe('2026-10-10')
+    expect(log.error).toHaveBeenCalledTimes(1)
+  })
 })

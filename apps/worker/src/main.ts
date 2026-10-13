@@ -17,6 +17,7 @@ import { createTelegramNotifier } from './adapters/notifier/telegram.js'
 import { noopSummarizer } from './adapters/summarizer/noop.js'
 import { createHeartbeat } from './pipeline/health.js'
 import { runLoop, createSleeper } from './pipeline/cycle.js'
+import { DIGEST_SOURCE_ID, restoreLastDigestDate } from './pipeline/digest.js'
 import type { SourcePlan } from './pipeline/ingest.js'
 
 const log = pino({ level: process.env.LOG_LEVEL ?? 'info' })
@@ -85,8 +86,10 @@ async function main(): Promise<void> {
 
   // lastDigestDate 를 메모리에서만 초기화하면 KST 자정을 넘긴 재기동이 그 값을
   // 오늘로 되돌려 전날 다이제스트가 영영 발송되지 않는다 — 따라잡기 루프가
-  // 통째로 무력화된다. DB 의 마지막 이벤트 날짜에서 복원한다.
-  const lastDigestDate = (await store.lastEventKstDate()) ?? kstDateString(new Date())
+  // 통째로 무력화된다. 마지막으로 끝낸 다이제스트 기록(digest_log)에서 복원한다.
+  const lastDigestDate = await restoreLastDigestDate(
+    store, DIGEST_SOURCE_ID, kstDateString(new Date()), log,
+  )
 
   if (cfg.newsEnabled) {
     // 명부(수 MB)는 여기, 즉 DB 의존 기동 작업(위의 seen·lastDigestDate 조회)이
