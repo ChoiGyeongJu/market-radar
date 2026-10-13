@@ -3,8 +3,8 @@ import type { NormalizedEvent } from '@app/shared'
 import { evaluateDart } from '../core/dart/rules.js'
 import type { EventSource } from '../ports/source.js'
 import type { EventStore } from '../ports/store.js'
-import { createSeenSet } from '../core/seen.js'
-import { runIngest, type IngestState, type SourcePlan } from './ingest.js'
+import { createSeenSet, SEEN_CAPACITY } from '../core/seen.js'
+import { runIngest, seedSeen, type IngestState, type SourcePlan } from './ingest.js'
 
 const NOW = new Date('2026-09-19T06:30:00Z')
 
@@ -483,5 +483,26 @@ describe('runIngest — 콜드 스타트 억제', () => {
     )
     expect(stats).toMatchObject({ skipped: 1, recorded: 0 })
     expect(recordEvent).not.toHaveBeenCalled()
+  })
+})
+
+describe('seedSeen — 기동 시 seen-set 시드', () => {
+  it('플랜의 seenCapacity 를 조회 건수와 집합 크기 양쪽에 쓴다', async () => {
+    const ids = Array.from({ length: 5 }, (_, i) => `n${i}`)
+    const recentExternalIds = vi.fn(async (_id: string, limit: number) => ids.slice(-limit))
+    const seen = await seedSeen(
+      { source: { id: 'news' } as EventSource, seenCapacity: 3 }, { recentExternalIds },
+    )
+    expect(recentExternalIds).toHaveBeenCalledWith('news', 3)
+    expect(seen.size).toBe(3)
+    // 집합 크기도 3이어야 한다 — 기본값(500)으로 만들면 이후 폴링에서 3을 넘겨 쌓인다.
+    for (const id of ['x1', 'x2', 'x3', 'x4']) seen.add(id)
+    expect(seen.size).toBe(3)
+  })
+
+  it('seenCapacity 가 없으면 SEEN_CAPACITY 를 쓴다', async () => {
+    const recentExternalIds = vi.fn(async () => [])
+    await seedSeen({ source: { id: 'dart' } as EventSource }, { recentExternalIds })
+    expect(recentExternalIds).toHaveBeenCalledWith('dart', SEEN_CAPACITY)
   })
 })

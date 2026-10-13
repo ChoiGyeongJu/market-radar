@@ -78,3 +78,28 @@ export const digestLog = pgTable('digest_log', {
   // source_id 가 앞이다 — 기동 시 조회가 `source_id = ? ORDER BY kst_date DESC LIMIT 1` 이다.
   pk: primaryKey({ columns: [t.sourceId, t.kstDate] }),
 }))
+
+/**
+ * 거시 트랙의 발화 이력(core/news/cluster.ts). 같은 키의 재발화 억제(쿨다운)와 시간당
+ * 상한이 이 테이블을 읽으므로 재기동을 넘어 살아남아야 한다 — 메모리에 두면 재기동
+ * 직후 방금 보낸 사건을 다시 보낸다.
+ *
+ * `capped` 도 기록한다. 상한에 걸려 버린 것을 세지 않으면 상한이 적절한지 알 수
+ * 없다(스펙 §3).
+ */
+export const macroFire = pgTable('macro_fire', {
+  id: bigserial('id', { mode: 'number' }).primaryKey(),
+  key: text('key').notNull(),
+  firedAt: timestamp('fired_at', { withTimezone: true }).notNull(),
+  // events.id 를 가리키지만 외래키는 걸지 않는다 — 걸면 90일 보관 정리가 이 행이
+  // 참조하는 이벤트를 지우려다 제약 위반으로 트랜잭션째 실패한다.
+  eventId: bigint('event_id', { mode: 'number' }).notNull(),
+  /** 발화 시점에 창 안에서 이 키를 쓴 서로 다른 매체 수. */
+  presses: integer('presses').notNull(),
+  /** 'breaking' | 'presses' */
+  trigger: text('trigger').notNull(),
+  /** 'sent' | 'capped' */
+  outcome: text('outcome').notNull(),
+}, (t) => ({
+  firedAtIdx: index('macro_fire_fired_at_idx').on(t.firedAt),
+}))

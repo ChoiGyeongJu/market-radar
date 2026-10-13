@@ -1,6 +1,6 @@
 import type { Evaluation, NormalizedEvent, Verdict } from '@app/shared'
 import { expiresAt } from '../core/policy.js'
-import type { SeenSet } from '../core/seen.js'
+import { createSeenSet, SEEN_CAPACITY, type SeenSet } from '../core/seen.js'
 import type { EventSource } from '../ports/source.js'
 import type { EventStore } from '../ports/store.js'
 
@@ -26,6 +26,28 @@ export type SourcePlan = {
    * api_usage 를 올리지 않는다 — 올리면 DART 예산 가드가 엉뚱하게 발동한다.
    */
   countsAgainstApiBudget: boolean
+  /**
+   * 이 소스의 seen-set 크기. 생략하면 SEEN_CAPACITY(목록 API 100건 × 5회분).
+   *
+   * 한 번의 폴링이 볼 수 있는 기사 수보다 넉넉히 커야 한다. 작으면 피드에 아직 떠
+   * 있는 항목이 집합에서 밀려나, 매 폴링 그 항목들이 유니크 충돌 no-op
+   * 트랜잭션으로 DB 까지 간다. 뉴스는 피드 여러 개를 합쳐 한 번에 수백~천 건을
+   * 보므로 공시보다 훨씬 커야 한다(rss.ts 의 NEWS_SEEN_CAPACITY).
+   */
+  seenCapacity?: number
+}
+
+/**
+ * 기동 시 seen-set 을 DB 에서 심는다. 조회 건수와 집합 크기를 **같은 값**으로 쓴다 —
+ * 크기만 키우고 조회를 작게 하면 재기동 직후 첫 폴링이 피드의 나머지를 전부 DB 로
+ * 보내고, 조회만 키우면 심은 직후 집합이 스스로 잘라낸다.
+ */
+export async function seedSeen(
+  plan: Pick<SourcePlan, 'source' | 'seenCapacity'>,
+  store: Pick<EventStore, 'recentExternalIds'>,
+): Promise<SeenSet> {
+  const capacity = plan.seenCapacity ?? SEEN_CAPACITY
+  return createSeenSet(await store.recentExternalIds(plan.source.id, capacity), capacity)
 }
 
 export type IngestDeps = { plan: SourcePlan; store: EventStore }

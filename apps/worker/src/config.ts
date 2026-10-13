@@ -58,6 +58,9 @@ const envSchema = z.object({
   // NEWS_ENABLED 와 같은 모양으로 둔다: 배포와 활성화를 분리하고, 켜는 것도
   // 끄는 것도 이미지를 되돌리지 않고 env 한 줄로 한다.
   RETENTION_ENABLED: optionalField(z.enum(['true', 'false']).default('false')),
+  // 거시 트랙(3c) 알림. NEWS_ENABLED 가 꺼져 있으면 뉴스 수집 자체가 없어 의미가 없다.
+  // 꺼 둬도 거시 후보 표시는 events 에 쌓인다 — 끈 채로 돌려 후보를 본 뒤 켠다.
+  MACRO_ENABLED: optionalField(z.enum(['true', 'false']).default('false')),
 })
 
 export type Config = {
@@ -84,6 +87,8 @@ export type Config = {
    * 백업이 아직 검증되지 않았으므로, 활성화는 사람이 명시적으로 한다.
    */
   retentionEnabled: boolean
+  /** 기본 false — 거시 알림은 구독자 채널에 새 종류의 메시지를 내보내므로 사람이 켠다. */
+  macroEnabled: boolean
 }
 
 export function loadConfig(env: Record<string, string | undefined>): Config {
@@ -99,5 +104,6 @@ export function loadConfig(env: Record<string, string | undefined>): Config {
     newsEnabled: parsed.NEWS_ENABLED === 'true',
     newsIntervalMs: parsed.NEWS_INTERVAL_MS,
     retentionEnabled: parsed.RETENTION_ENABLED === 'true',
+    macroEnabled: parsed.MACRO_ENABLED === 'true',
   }
 }

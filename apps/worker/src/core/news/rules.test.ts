@@ -195,3 +195,27 @@ describe('evaluateNews — 매칭된 회사를 버리지 않는다', () => {
     expect(e.subject).toBeUndefined()
   })
 })
+
+describe('evaluateNews — 종목 트랙에서 떨어진 것은 거시 후보로 표시한다', () => {
+  it('종목이 안 잡혀도 거시 게이트를 통과하면 사유가 macro:<키> 다 — 아직 보내지 않는다', () => {
+    expect(evaluateNews(ev('[속보] 코스피 매도 사이드카 발동'), INDEX, '').verdict).toEqual({
+      action: 'drop', reason: 'macro:market:코스피:사이드카',
+    })
+  })
+
+  it('종목은 잡혔지만 키워드가 없어도 거시 후보가 되고, 매칭된 회사는 그대로 들고 간다', () => {
+    const r = evaluateNews(ev('삼성전자 5% 급락…코스피 사이드카 발동'), INDEX, '')
+    expect(r.verdict).toEqual({ action: 'drop', reason: 'macro:market:코스피:사이드카' })
+    expect(r.subject).toEqual({ name: '삼성전자', ticker: '005930' })
+  })
+
+  it('종목 트랙을 통과한 기사는 거시 후보가 아니다 — 이미 개별 알림으로 나간다', () => {
+    expect(evaluateNews(ev('삼성전자 유상증자…코스피 급락'), INDEX, '').verdict)
+      .toMatchObject({ action: 'pass', tier: 'critical' })
+  })
+
+  it('거시 게이트도 통과하지 못하면 원래 사유 그대로다', () => {
+    expect(evaluateNews(ev('트럼프, 그리스 대사 해임 검토'), INDEX, '').verdict)
+      .toEqual({ action: 'drop', reason: 'no-corp-match' })
+  })
+})

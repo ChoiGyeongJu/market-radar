@@ -939,3 +939,88 @@ describe('pruneOlderThan', () => {
     expect(collectParamValues(cond)).toContain(cutoff)
   })
 })
+
+describe('거시 트랙 저장소', () => {
+  it('recordMacroFire — sent 면 발화 기록과 outbox 예약을 같은 트랜잭션에서 한다', async () => {
+    const calls: Array<{ table: string; values: Record<string, unknown> }> = []
+    let transactions = 0
+    const tx = {
+      insert: (table: unknown) => ({
+        values: async (values: Record<string, unknown>) => { calls.push({ table: getTableName(table as never), values }) },
+      }),
+    }
+    const db = { transaction: async (fn: (t: unknown) => Promise<unknown>) => { transactions += 1; return fn(tx) } }
+    const firedAt = new Date('2026-10-13T00:50:00Z')
+    const payload = { ...event, sourceId: 'news', raw: { press: '연합뉴스', macro: { presses: 1 } } }
+
+    await createPostgresStore(db as unknown as Db).recordMacroFire(
+      { key: 'geo:북한:미사일', firedAt, eventId: 42, presses: 1, trigger: 'breaking', outcome: 'sent' },
+      { tier: 'high', payload, expiresAt: new Date('2026-10-13T01:20:00Z') },
+    )
+
+    expect(transactions).toBe(1)
+    expect(calls.map((c) => c.table)).toEqual(['macro_fire', 'outbox'])
+    expect(calls[1]!.values).toMatchObject({
+      eventId: 42, tier: 'high', status: 'pending', attempts: 0, nextAttemptAt: firedAt, payload,
+    })
+  })
+
+  it('recordMacroFire — capped 면 기록만 하고 outbox 는 건드리지 않는다', async () => {
+    const tables: string[] = []
+    const tx = { insert: (table: unknown) => ({ values: async () => { tables.push(getTableName(table as never)) } }) }
+    const db = { transaction: async (fn: (t: unknown) => Promise<unknown>) => fn(tx) }
+    await createPostgresStore(db as unknown as Db).recordMacroFire(
+      { key: 'k', firedAt: new Date(), eventId: 1, presses: 3, trigger: 'presses', outcome: 'capped' }, null,
+    )
+    expect(tables).toEqual(['macro_fire'])
+  })
+
+  it('macroCandidates — 뉴스 소스의 macro: 행만, since 보다 뒤인 것만 고르고 이벤트로 되살린다', async () => {
+    const seen = new Date('2026-10-13T00:45:00Z')
+    const { db, whereCalls } = fakeThenableDb([{
+      id: 9, sourceId: 'news', externalId: 'yna:1', occurredAt: null, firstSeenAt: seen,
+      title: '[속보] 코스피 사이드카', url: 'https://x/1', corpName: '삼성전자', ticker: '005930',
+      rule: 'macro:market:코스피:사이드카', raw: { press: '연합뉴스' },
+    }])
+    const since = new Date('2026-10-13T00:20:00Z')
+    const rows = await createPostgresStore(db).macroCandidates(since)
+
+    const text = deepSqlText(whereCalls[0])
+    expect(collectParamValues(whereCalls[0])).toContain('news')
+    expect(text).toContain("source_id = $")
+    // like 의 패턴은 Param 이 아니라 템플릿에 박힌 원시 문자열로 들어간다.
+    expect(text).toContain("rule like 'macro:%'")
+    expect(collectParamValues(whereCalls[0])).toContain(since)
+    // `>` 여야 한다 — `>=` 면 콜드 스타트 시각에 한꺼번에 기록된 백로그가 들어온다.
+    expect(text).toContain('first_seen_at > $')
+    expect(rows).toEqual([{
+      eventId: 9, rule: 'macro:market:코스피:사이드카',
+      event: {
+        sourceId: 'news', externalId: 'yna:1', occurredAt: null, firstSeenAt: seen,
+        title: '[속보] 코스피 사이드카', url: 'https://x/1',
+        subject: { name: '삼성전자', ticker: '005930' }, raw: { press: '연합뉴스' },
+      },
+    }])
+  })
+
+  it('recentMacroFires — outcome 을 그대로 돌려준다(capped 도 쿨다운을 건다)', async () => {
+    const at = new Date('2026-10-13T00:10:00Z')
+    const { db } = fakeThenableDb([
+      { key: 'a', firedAt: at, outcome: 'sent' }, { key: 'b', firedAt: at, outcome: 'capped' },
+    ])
+    expect(await createPostgresStore(db).recentMacroFires(new Date(0))).toEqual([
+      { key: 'a', firedAt: at, outcome: 'sent' }, { key: 'b', firedAt: at, outcome: 'capped' },
+    ])
+  })
+})
+
+/** SQL 트리를 사람이 읽는 문자열로 편다 — 컬럼은 이름, Param 은 `$`, 원시 문자열은 따옴표. */
+function deepSqlText(node: unknown): string {
+  if (is(node, Param)) return '$'
+  if (is(node, Column)) return (node as Column).name
+  if (node instanceof StringChunk) return node.value.join('')
+  if (node instanceof SQL) return node.queryChunks.map(deepSqlText).join('')
+  if (Array.isArray(node)) return node.map(deepSqlText).join(', ')
+  if (typeof node === 'string') return `'${node}'`
+  return String(node)
+}
