@@ -7,10 +7,10 @@ import { evaluateDart } from './core/dart/rules.js'
 import { evaluateNews } from './core/news/rules.js'
 import { buildCorpIndex } from './core/news/corp-index.js'
 import { pollIntervalMs } from './core/schedule.js'
-import { createSeenSet, SEEN_CAPACITY, type SeenSet } from './core/seen.js'
+import { type SeenSet } from './core/seen.js'
 import { loadConfig } from './config.js'
 import { createDartSource } from './adapters/sources/dart.js'
-import { createRssSource, FEEDS } from './adapters/sources/rss.js'
+import { createRssSource, FEEDS, NEWS_SEEN_CAPACITY } from './adapters/sources/rss.js'
 import { fetchCorpEntries } from './adapters/sources/corp-code.js'
 import { createPostgresStore, type Db } from './adapters/store/postgres.js'
 import { createTelegramNotifier } from './adapters/notifier/telegram.js'
@@ -18,7 +18,7 @@ import { noopSummarizer } from './adapters/summarizer/noop.js'
 import { createHeartbeat } from './pipeline/health.js'
 import { runLoop, createSleeper } from './pipeline/cycle.js'
 import { DIGEST_SOURCE_ID, restoreLastDigestDate } from './pipeline/digest.js'
-import type { SourcePlan } from './pipeline/ingest.js'
+import { seedSeen, type SourcePlan } from './pipeline/ingest.js'
 
 const log = pino({ level: process.env.LOG_LEVEL ?? 'info' })
 
@@ -81,7 +81,7 @@ async function main(): Promise<void> {
   // 안 보인다.
   const seen = new Map<string, SeenSet>()
   for (const p of plans) {
-    seen.set(p.source.id, createSeenSet(await store.recentExternalIds(p.source.id, SEEN_CAPACITY)))
+    seen.set(p.source.id, await seedSeen(p, store))
   }
 
   // lastDigestDate 를 메모리에서만 초기화하면 KST 자정을 넘긴 재기동이 그 값을
@@ -108,7 +108,7 @@ async function main(): Promise<void> {
       onFeedError: (feedId, err) => log.error({ err, feedId }, 'rss feed failed'),
     })
     log.info({ corps: corpIndex.byLength.length, feeds: FEEDS.length }, 'news source enabled')
-    plans.push({
+    const newsPlan: SourcePlan = {
       source: rss,
       // description 은 판정에만 쓰고 이벤트에 담지 않으므로 여기서 꺼내 넘긴다.
       // rss.descriptionOf 는 fetchLatest 가 매 호출마다 통째로 교체하는 맵을
@@ -118,9 +118,11 @@ async function main(): Promise<void> {
       evaluate: (e) => evaluateNews(e, corpIndex, rss.descriptionOf(e.externalId)),
       intervalMs: () => cfg.newsIntervalMs,
       countsAgainstApiBudget: false,
-    })
+      seenCapacity: NEWS_SEEN_CAPACITY,
+    }
+    plans.push(newsPlan)
     // 위 seen 시딩 루프가 돌 때는 뉴스 플랜이 아직 plans 에 없었으므로 따로 심는다.
-    seen.set(rss.id, createSeenSet(await store.recentExternalIds(rss.id, SEEN_CAPACITY)))
+    seen.set(rss.id, await seedSeen(newsPlan, store))
   }
 
   // 첫 사이클은 기록만 하고 한 건도 발송하지 않는다. 워커는 자신이 얼마나 오래

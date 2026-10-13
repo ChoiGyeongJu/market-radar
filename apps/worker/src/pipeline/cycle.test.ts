@@ -522,6 +522,21 @@ describe('runCycle — 다중 소스', () => {
     expect(good.source.fetchLatest).toHaveBeenCalledTimes(1)
   })
 
+  it('심어 둔 seen-set 이 없으면 플랜의 seenCapacity 로 만든다', async () => {
+    const news = { ...fakePlan('news', 10_000), seenCapacity: 2 }
+    news.source.fetchLatest = vi.fn(async () => ['a', 'b', 'c'].map((externalId) => ({
+      sourceId: 'news', externalId, occurredAt: null, firstSeenAt: MULTI_NOW,
+      title: externalId, url: 'https://x', raw: {},
+    })))
+    const deps = depsWith([news])
+    ;(deps.store as unknown as { recordEvent: unknown }).recordEvent = vi.fn(async () => true)
+    const state = initialState([news])
+    state.seen.delete('news')
+
+    const next = await runCycle(deps, state, MULTI_NOW)
+    expect(next.seen.get('news')?.size).toBe(2)
+  })
+
   it('seen-set은 소스마다 따로다 — externalId가 충돌할 수 있다', async () => {
     const a = fakePlan('dart', 10_000)
     const b = fakePlan('news', 10_000)

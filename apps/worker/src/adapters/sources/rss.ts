@@ -5,8 +5,17 @@ import { parseRssFeed } from '../../core/news/rss.js'
 const REQUEST_TIMEOUT_MS = 10_000
 
 export type FeedConfig = {
-  /** 내부 식별자. externalId 접두어로 쓴다. */
+  /** 피드 식별자. 실패 로그와 HTTP validator 의 키다. */
   id: string
+  /**
+   * 매체 식별자. externalId 접두어로 쓴다 — 피드가 아니라 **매체** 단위여야 한다.
+   *
+   * 한 매체의 기사가 여러 섹션 피드에 동시에 실린다(연합의 시장·경제·최신 피드에
+   * 같은 기사가 같은 guid 로 나온다). 피드 id 를 접두어로 쓰면 같은 기사가 서로 다른
+   * 이벤트로 기록되고, 종목 트랙을 통과하면 **같은 알림이 피드 수만큼 나간다.**
+   * 거시 트랙의 매체 수 세기도 이 단위를 전제한다.
+   */
+  pressId: string
   /** 발송 메시지에 표시할 매체명. */
   press: string
   url: string
@@ -19,12 +28,21 @@ export type FeedConfig = {
  * 전문을 받는다.
  */
 export const FEEDS: readonly FeedConfig[] = [
-  { id: 'yna-market', press: '연합뉴스', url: 'https://www.yna.co.kr/rss/market.xml' },
-  { id: 'mt', press: '머니투데이', url: 'https://rss.mt.co.kr/mt_news.xml' },
-  { id: 'hk-fin', press: '한국경제', url: 'https://www.hankyung.com/feed/finance' },
-  { id: 'chosunbiz', press: '조선비즈', url: 'https://biz.chosun.com/arc/outboundfeeds/rss/category/stock/?outputType=xml' },
-  { id: 'mk-stock', press: '매일경제', url: 'https://www.mk.co.kr/rss/50200011/' },
+  { id: 'yna-market', pressId: 'yna', press: '연합뉴스', url: 'https://www.yna.co.kr/rss/market.xml' },
+  { id: 'mt', pressId: 'mt', press: '머니투데이', url: 'https://rss.mt.co.kr/mt_news.xml' },
+  { id: 'hk-fin', pressId: 'hk', press: '한국경제', url: 'https://www.hankyung.com/feed/finance' },
+  { id: 'chosunbiz', pressId: 'chosunbiz', press: '조선비즈', url: 'https://biz.chosun.com/arc/outboundfeeds/rss/category/stock/?outputType=xml' },
+  { id: 'mk-stock', pressId: 'mk', press: '매일경제', url: 'https://www.mk.co.kr/rss/50200011/' },
 ]
+
+/**
+ * 뉴스 seen-set 크기. 한 번의 폴링이 볼 수 있는 최대 기사 수(피드당
+ * MAX_ITEMS_PER_FEED × 피드 수)의 두 배 이상이어야 한다 — 그보다 작으면 피드에 아직
+ * 떠 있는 기사가 집합에서 밀려나, 매 폴링 그 기사들이 유니크 충돌 no-op 트랜잭션으로
+ * DB 까지 간다. 공시용 500 을 그대로 쓰면 피드가 15개일 때 분당 수백 건이다.
+ * 문자열 5,000개는 메모리에서 무시할 크기다.
+ */
+export const NEWS_SEEN_CAPACITY = 5_000
 
 // 이데일리는 넣지 않는다. rss.edaily.co.kr 이 TLS 1.0 으로만 협상하는데 Node 의
 // 기본 최소 버전은 TLS 1.2 라 ERR_SSL_UNSUPPORTED_PROTOCOL 로 실패한다. 피드 하나를
@@ -94,7 +112,7 @@ export function createRssSource(cfg: RssSourceConfig): RssSource {
     const events: NormalizedEvent[] = []
     const itemDescriptions = new Map<string, string>()
     for (const item of items) {
-      const externalId = `${feed.id}:${item.guid}`
+      const externalId = `${feed.pressId}:${item.guid}`
       itemDescriptions.set(externalId, item.description)
       events.push({
         sourceId: 'news',
@@ -127,6 +145,7 @@ export function createRssSource(cfg: RssSourceConfig): RssSource {
       // 타임아웃(10s)까지 가는 것만으로 fetchLatest 전체가 그만큼 늦어지고,
       // 다음 태스크에서 이 소스가 공시 폴링과 같은 루프를 타면 그 지연이 정작
       // 지연이 문제가 되는 공시 쪽까지 밀어낸다.
+      const emitted = new Set<string>()
       const results = await Promise.allSettled(
         cfg.feeds.map((feed) => fetchOneFeed(feed, now)),
       )
@@ -143,9 +162,16 @@ export function createRssSource(cfg: RssSourceConfig): RssSource {
           return
         }
         if (result.value === null) return // 304
-        out.push(...result.value.events)
+        // 같은 매체의 여러 섹션 피드에 실린 같은 기사는 externalId 가 같다(FeedConfig.pressId).
+        // 먼저 나온 것 하나만 넘긴다 — 둘 다 넘기면 두 번째가 유니크 충돌 no-op 으로
+        // DB 왕복만 하나 더 쓴다.
+        for (const event of result.value.events) {
+          if (emitted.has(event.externalId)) continue
+          emitted.add(event.externalId)
+          out.push(event)
+        }
         for (const [externalId, description] of result.value.descriptions) {
-          nextDescriptions.set(externalId, description)
+          if (!nextDescriptions.has(externalId)) nextDescriptions.set(externalId, description)
         }
       })
 

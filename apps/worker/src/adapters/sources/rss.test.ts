@@ -1,5 +1,6 @@
 import { describe, it, expect, vi } from 'vitest'
-import { createRssSource } from './rss.js'
+import { createRssSource, FEEDS, NEWS_SEEN_CAPACITY } from './rss.js'
+import { MAX_ITEMS_PER_FEED } from '../../core/news/rss.js'
 
 const FEED = (title: string, link: string) => `<rss><channel><item>
   <title>${title}</title><link>${link}</link><guid>${link}</guid>
@@ -15,14 +16,32 @@ describe('createRssSource', () => {
       new Response(FEED(`제목 ${u.slice(-1)}`, `https://x/${u.slice(-1)}`), { status: 200 }))
     const src = createRssSource({
       feeds: [
-        { id: 'a', press: '연합', url: 'https://f/a' },
-        { id: 'b', press: '이데일리', url: 'https://f/b' },
+        { id: 'a', pressId: 'a', press: '연합', url: 'https://f/a' },
+        { id: 'b', pressId: 'b', press: '이데일리', url: 'https://f/b' },
       ],
       fetchImpl: f as unknown as typeof fetch,
     })
     const out = await src.fetchLatest(NOW)
     expect(out).toHaveLength(2)
     expect(out.map((e) => e.sourceId)).toEqual(['news', 'news'])
+  })
+
+  it('externalId 는 피드가 아니라 매체 단위다 — 한 매체의 여러 섹션 피드에 실린 같은 기사는 같은 id 다', async () => {
+    // 연합의 시장·경제·최신 피드에 같은 기사가 같은 guid 로 실린다. 피드 단위 id 면
+    // 같은 기사가 서로 다른 이벤트로 기록되고, 통과하면 같은 알림이 피드 수만큼 나간다.
+    const f = vi.fn(async () => new Response(FEED('같은 기사', 'https://x/1'), { status: 200 }))
+    const src = createRssSource({
+      feeds: [
+        { id: 'yna-market', pressId: 'yna', press: '연합뉴스', url: 'https://f/a' },
+        { id: 'yna-economy', pressId: 'yna', press: '연합뉴스', url: 'https://f/b' },
+        { id: 'mk-stock', pressId: 'mk', press: '매일경제', url: 'https://f/c' },
+      ],
+      fetchImpl: f as unknown as typeof fetch,
+    })
+    // 한 번의 fetch 안에서도 매체 단위로 한 번만 돌려준다 — 같은 기사를 두 번 넘기면
+    // 수집이 두 번째를 유니크 충돌 no-op 트랜잭션으로 DB 까지 보낸다.
+    const ids = (await src.fetchLatest(NOW)).map((e) => e.externalId)
+    expect(ids).toEqual(['yna:https://x/1', 'mk:https://x/1'])
   })
 
   it('두 번째 호출에 If-None-Match를 붙이고 304면 건너뛴다', async () => {
@@ -33,7 +52,7 @@ describe('createRssSource', () => {
       // 의 Response 생성자가 "Invalid response status code 304" 로 던진다. null 만 허용.
       .mockResolvedValueOnce(new Response(null, { status: 304 }))
     const src = createRssSource({
-      feeds: [{ id: 'a', press: '연합', url: 'https://f/a' }],
+      feeds: [{ id: 'a', pressId: 'a', press: '연합', url: 'https://f/a' }],
       fetchImpl: f as unknown as typeof fetch,
     })
     expect(await src.fetchLatest(NOW)).toHaveLength(1)
@@ -48,8 +67,8 @@ describe('createRssSource', () => {
       .mockResolvedValueOnce(new Response(FEED('살아남은 기사', 'https://x/2'), { status: 200 }))
     const src = createRssSource({
       feeds: [
-        { id: 'a', press: '연합', url: 'https://f/a' },
-        { id: 'b', press: '이데일리', url: 'https://f/b' },
+        { id: 'a', pressId: 'a', press: '연합', url: 'https://f/a' },
+        { id: 'b', pressId: 'b', press: '이데일리', url: 'https://f/b' },
       ],
       fetchImpl: f as unknown as typeof fetch,
     })
@@ -61,7 +80,7 @@ describe('createRssSource', () => {
   it('raw에 description을 담지 않는다 — 저작권', async () => {
     const f = vi.fn(async () => new Response(FEED('제목', 'https://x/1'), { status: 200 }))
     const src = createRssSource({
-      feeds: [{ id: 'a', press: '연합', url: 'https://f/a' }],
+      feeds: [{ id: 'a', pressId: 'a', press: '연합', url: 'https://f/a' }],
       fetchImpl: f as unknown as typeof fetch,
     })
     const [e] = await src.fetchLatest(NOW)
@@ -72,7 +91,7 @@ describe('createRssSource', () => {
   it('firstSeenAt은 now, occurredAt은 pubDate다', async () => {
     const f = vi.fn(async () => new Response(FEED('제목', 'https://x/1'), { status: 200 }))
     const src = createRssSource({
-      feeds: [{ id: 'a', press: '연합', url: 'https://f/a' }],
+      feeds: [{ id: 'a', pressId: 'a', press: '연합', url: 'https://f/a' }],
       fetchImpl: f as unknown as typeof fetch,
     })
     const [e] = await src.fetchLatest(NOW)
@@ -83,7 +102,7 @@ describe('createRssSource', () => {
   it('description은 판정용으로 곁에 남긴다', async () => {
     const f = vi.fn(async () => new Response(FEED('제목', 'https://x/1'), { status: 200 }))
     const src = createRssSource({
-      feeds: [{ id: 'a', press: '연합', url: 'https://f/a' }],
+      feeds: [{ id: 'a', pressId: 'a', press: '연합', url: 'https://f/a' }],
       fetchImpl: f as unknown as typeof fetch,
     })
     const [e] = await src.fetchLatest(NOW)
@@ -102,7 +121,7 @@ describe('createRssSource', () => {
       })
       .mockResolvedValueOnce(new Response(FEED('복구', 'https://x/3'), { status: 200 }))
     const src = createRssSource({
-      feeds: [{ id: 'a', press: '연합', url: 'https://f/a' }],
+      feeds: [{ id: 'a', pressId: 'a', press: '연합', url: 'https://f/a' }],
       fetchImpl: f as unknown as typeof fetch,
     })
 
@@ -123,7 +142,7 @@ describe('createRssSource', () => {
       .mockResolvedValueOnce(new Response(FEED('제목2', 'https://x/2'), { status: 200 }))
       .mockResolvedValueOnce(new Response(FEED('제목3', 'https://x/3'), { status: 200 }))
     const src = createRssSource({
-      feeds: [{ id: 'a', press: '연합', url: 'https://f/a' }],
+      feeds: [{ id: 'a', pressId: 'a', press: '연합', url: 'https://f/a' }],
       fetchImpl: f as unknown as typeof fetch,
     })
 
@@ -154,8 +173,8 @@ describe('createRssSource', () => {
     })
     const src = createRssSource({
       feeds: [
-        { id: 'hang', press: '느림', url: 'https://f/hang' },
-        { id: 'prompt', press: '빠름', url: 'https://f/prompt' },
+        { id: 'hang', pressId: 'hang', press: '느림', url: 'https://f/hang' },
+        { id: 'prompt', pressId: 'prompt', press: '빠름', url: 'https://f/prompt' },
       ],
       fetchImpl: f as unknown as typeof fetch,
     })
@@ -175,5 +194,26 @@ describe('createRssSource', () => {
 
     expect(out).toHaveLength(1)
     expect(out[0]!.title).toBe('신속')
+  })
+})
+
+describe('FEEDS', () => {
+  it('매체명과 pressId 가 일대일이다 — 어긋나면 같은 기사가 두 번 나가거나 다른 매체가 한 매체로 세진다', () => {
+    const byPress = new Map<string, Set<string>>()
+    const byId = new Map<string, Set<string>>()
+    for (const f of FEEDS) {
+      byPress.set(f.press, (byPress.get(f.press) ?? new Set()).add(f.pressId))
+      byId.set(f.pressId, (byId.get(f.pressId) ?? new Set()).add(f.press))
+    }
+    for (const ids of byPress.values()) expect(ids.size).toBe(1)
+    for (const presses of byId.values()) expect(presses.size).toBe(1)
+  })
+
+  it('피드 id 는 겹치지 않는다 — HTTP validator 와 실패 로그의 키다', () => {
+    expect(new Set(FEEDS.map((f) => f.id)).size).toBe(FEEDS.length)
+  })
+
+  it('NEWS_SEEN_CAPACITY 는 한 번의 폴링이 볼 수 있는 최대 기사 수의 두 배 이상이다', () => {
+    expect(NEWS_SEEN_CAPACITY).toBeGreaterThanOrEqual(2 * MAX_ITEMS_PER_FEED * FEEDS.length)
   })
 })

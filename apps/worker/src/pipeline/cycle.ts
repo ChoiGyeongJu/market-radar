@@ -2,7 +2,7 @@ import { budgetGuard, kstDateString } from '../core/budget.js'
 import { ALERT_THRESHOLD, createCircuit } from '../core/circuit.js'
 import type { Circuit } from '../core/circuit.js'
 import { pollIntervalMs } from '../core/schedule.js'
-import { createSeenSet } from '../core/seen.js'
+import { createSeenSet, SEEN_CAPACITY } from '../core/seen.js'
 import type { SeenSet } from '../core/seen.js'
 import type { EventStore } from '../ports/store.js'
 import type { Notifier } from '../ports/notifier.js'
@@ -189,7 +189,7 @@ export async function runCycle(
         const wasColdStart = coldStart.get(id) ?? true
         const ingest = await runIngest(
           { plan, store: deps.store },
-          { seen: seen.get(id) ?? createSeenSet(), coldStart: wasColdStart },
+          { seen: seen.get(id) ?? createSeenSet([], plan.seenCapacity ?? SEEN_CAPACITY), coldStart: wasColdStart },
           now,
         )
         seen.set(id, ingest.state.seen)
